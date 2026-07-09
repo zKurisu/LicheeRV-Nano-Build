@@ -1,5 +1,7 @@
 # LicheeRV-Nano-Build
 
+如果仅需编译 `uboot` 即 `fip.bin`，查看 ***[build uboot](#build-u-boot)***
+
 # download source
 
 ```
@@ -29,6 +31,15 @@ defconfig sg2002_licheervnano_sd
 # A53:
 # defconfig sg2002_licheea53nano_sd
 build_all
+```
+
+# build u-boot
+
+```
+source build/cvisetup.sh
+# C906:
+defconfig sg2002_licheervnano_sd
+build_uboot
 ```
 
 # build fail
