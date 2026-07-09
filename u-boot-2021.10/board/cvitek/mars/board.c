@@ -310,11 +310,16 @@ int board_usb_init(int index, enum usb_init_type init)
 {
 	u32 value;
 
+	/* Enable USB clocks: AXI4, APB, 125M, 33K, 12M */
+	clrsetbits_le32(REG_CLK_EN_1, USB_CLK_EN1_MASK, USB_CLK_EN1_MASK);
+	clrsetbits_le32(REG_CLK_EN_2, USB_CLK_EN2_MASK, USB_CLK_EN2_MASK);
+
 	value = mmio_read_32(TOP_BASE + REG_TOP_SOFT_RST) & (~BIT_TOP_SOFT_RST_USB);
 	mmio_write_32(TOP_BASE + REG_TOP_SOFT_RST, value);
 	udelay(50);
 	value = mmio_read_32(TOP_BASE + REG_TOP_SOFT_RST) | BIT_TOP_SOFT_RST_USB;
 	mmio_write_32(TOP_BASE + REG_TOP_SOFT_RST, value);
+	mdelay(10);
 
 	/* Set USB phy configuration */
 	value = mmio_read_32(REG_TOP_USB_PHY_CTRL);
@@ -326,6 +331,7 @@ int board_usb_init(int index, enum usb_init_type init)
 	mmio_write_32(REG_TOP_USB_ECO, mmio_read_32(REG_TOP_USB_ECO) | BIT_TOP_USB_ECO_RX_FLUSH);
 
 	printf("cvi_usb_hw_init done\n");
+	mdelay(10);
 
 	return dwc2_udc_probe(&cv182x_otg_data);
 }

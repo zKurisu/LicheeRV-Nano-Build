@@ -41,7 +41,9 @@
 #include <asm/unaligned.h>
 #include <asm/io.h>
 
+#ifdef CONFIG_ARM
 #include <asm/mach-types.h>
+#endif
 
 #include <power/regulator.h>
 
@@ -173,7 +175,15 @@ __weak void otg_phy_off(struct dwc2_udc *dev) {}
  */
 static void udc_disable(struct dwc2_udc *dev)
 {
+	u32 uTemp;
+
 	debug_cond(DEBUG_SETUP != 0, "%s: %p\n", __func__, dev);
+
+	/* Soft-disconnect: drive D+ low so the host detects removal. */
+	uTemp = readl(&reg->dctl);
+	uTemp |= SOFT_DISCONNECT;
+	writel(uTemp, &reg->dctl);
+	mdelay(10);
 
 	udc_set_address(dev, 0);
 
@@ -455,13 +465,60 @@ static void reconfig_usbd(struct dwc2_udc *dev)
 {
 	/* 2. Soft-reset OTG Core and then unreset again. */
 	int i;
-	unsigned int uTemp = writel(CORE_SOFT_RESET, &reg->grstctl);
+	unsigned int uTemp;
 	uint32_t dflt_gusbcfg;
 	uint32_t rx_fifo_sz, tx_fifo_sz, np_tx_fifo_sz;
 	u32 max_hw_ep;
 	int pdata_hw_ep;
 
-	debug("Reseting OTG controller\n");
+	/* Core soft reset. DWC2 >= 4.20a signals completion via CSFTRST_DONE
+	 * (bit29) instead of self-clearing CSFTRST (bit0). */
+	{
+		u32 snpsid = readl((void *)((uintptr_t)reg + 0x040)) &
+			     DWC2_CORE_REV_MASK;
+		u32 greset;
+		int count = 0;
+
+		if (snpsid < (DWC2_CORE_REV_4_20a & DWC2_CORE_REV_MASK)) {
+			writel(CORE_SOFT_RESET, &reg->grstctl);
+			do {
+				udelay(1);
+				greset = readl(&reg->grstctl);
+				if (++count > 100000) {
+					printf("reconfig_usbd: HANG soft reset GRSTCTL=%08x\n",
+					       greset);
+					break;
+				}
+			} while (greset & CORE_SOFT_RESET);
+		} else {
+			writel(CORE_SOFT_RESET, &reg->grstctl);
+			do {
+				udelay(1);
+				greset = readl(&reg->grstctl);
+				if (++count > 100000) {
+					printf("reconfig_usbd: HANG soft reset(4.2) GRSTCTL=%08x\n",
+					       greset);
+					break;
+				}
+			} while (!(greset & CSFTRST_DONE));
+			greset = readl(&reg->grstctl);
+			greset &= ~CORE_SOFT_RESET;
+			greset |= CSFTRST_DONE;
+			writel(greset, &reg->grstctl);
+		}
+
+		/* Wait for AHB master IDLE state. */
+		count = 0;
+		do {
+			udelay(1);
+			greset = readl(&reg->grstctl);
+			if (++count > 100000) {
+				printf("reconfig_usbd: HANG AHB idle GRSTCTL=%08x\n",
+				       greset);
+				break;
+			}
+		} while (!(greset & AHB_MASTER_IDLE));
+	}
 
 	dflt_gusbcfg =
 		0<<15		/* PHY Low Power Clock sel*/

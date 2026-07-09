@@ -41,7 +41,7 @@ usb_descriptor_fillbuf(void *buf, unsigned int buflen,
 
 	/* fill buffer from src[] until null descriptor ptr */
 	for (; *src != NULL; src++) {
-		unsigned int		len = (*src)->b_length;
+		unsigned int		len = (*src)->bLength;
 
 		if (len > buflen)
 			return -EINVAL;
@@ -99,9 +99,9 @@ int usb_gadget_config_buf(
 		return -EINVAL;
 
 	/* patch up the config descriptor */
-	cp->b_length = USB_DT_CONFIG_SIZE;
-	cp->b_descriptor_type = USB_DT_CONFIG;
-	put_unaligned_le16(len, &cp->w_total_length);
-	cp->bm_attributes |= USB_CONFIG_ATT_ONE;
+	cp->bLength = USB_DT_CONFIG_SIZE;
+	cp->bDescriptorType = USB_DT_CONFIG;
+	put_unaligned_le16(len, &cp->wTotalLength);
+	cp->bmAttributes |= USB_CONFIG_ATT_ONE;
 	return len;
 }

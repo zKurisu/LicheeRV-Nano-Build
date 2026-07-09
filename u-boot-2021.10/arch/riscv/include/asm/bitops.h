@@ -103,6 +103,40 @@ static inline int __test_and_change_bit(int nr, void *addr)
 }
 
 /*
+ * U-Boot on RISC-V is single-threaded, so the atomic variants can be
+ * simple wrappers around the non-atomic __* helpers above.
+ */
+static inline void set_bit(int nr, volatile void *addr)
+{
+	__set_bit(nr, (void *)addr);
+}
+
+static inline void clear_bit(int nr, volatile void *addr)
+{
+	__clear_bit(nr, (void *)addr);
+}
+
+static inline void change_bit(int nr, volatile void *addr)
+{
+	__change_bit(nr, (void *)addr);
+}
+
+static inline int test_and_set_bit(int nr, volatile void *addr)
+{
+	return __test_and_set_bit(nr, (void *)addr);
+}
+
+static inline int test_and_clear_bit(int nr, volatile void *addr)
+{
+	return __test_and_clear_bit(nr, (void *)addr);
+}
+
+static inline int test_and_change_bit(int nr, volatile void *addr)
+{
+	return __test_and_change_bit(nr, (void *)addr);
+}
+
+/*
  * This routine doesn't need to be atomic.
  */
 static inline int test_bit(int nr, const void *addr)

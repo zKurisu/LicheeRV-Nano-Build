@@ -101,6 +101,13 @@
 /* usb */
 #define USB_BASE            0x04340000
 
+/* clkgen */
+#define CLKGEN_BASE         (TOP_BASE + 0x2000)
+#define REG_CLK_EN_1        (CLKGEN_BASE + 0x004)
+#define REG_CLK_EN_2        (CLKGEN_BASE + 0x008)
+#define USB_CLK_EN1_MASK    (BIT(28) | BIT(29) | BIT(30) | BIT(31))
+#define USB_CLK_EN2_MASK    (BIT(0))
+
 /* ethernet phy */
 #define ETH_PHY_BASE        0x03009000
 #define ETH_PHY_INIT_MASK   0xFFFFFFF9

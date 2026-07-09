@@ -39,6 +39,9 @@
 
 void otg_phy_init(struct dwc2_udc *dev)
 {
+#ifdef CONFIG_TARGET_CVITEK_CV181X
+	/* CVITEK SoC PHY is initialized in board_usb_init(), skip. */
+#else
 	unsigned int usb_phy_ctrl = dev->pdata->usb_phy_ctrl;
 	struct dwc2_usbotg_phy *phy =
 		(struct dwc2_usbotg_phy *)dev->pdata->regs_phy;
@@ -73,10 +76,14 @@ void otg_phy_init(struct dwc2_udc *dev)
 	writel(readl(&phy->rstcon)
 	       &~(PHY_SW_RST0 | LINK_SW_RST | PHYLNK_SW_RST), &phy->rstcon);
 	udelay(10);
+#endif
 }
 
 void otg_phy_off(struct dwc2_udc *dev)
 {
+#ifdef CONFIG_TARGET_CVITEK_CV181X
+	/* CVITEK SoC PHY teardown handled by board, skip. */
+#else
 	unsigned int usb_phy_ctrl = dev->pdata->usb_phy_ctrl;
 	struct dwc2_usbotg_phy *phy =
 		(struct dwc2_usbotg_phy *)dev->pdata->regs_phy;
@@ -98,4 +105,5 @@ void otg_phy_off(struct dwc2_udc *dev)
 	udelay(10000);
 
 	dev->pdata->phy_control(0);
+#endif
 }

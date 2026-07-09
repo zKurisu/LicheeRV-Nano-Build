@@ -164,17 +164,13 @@
 /* #define CONFIG_USB_DWC2_REG_ADDR	0x04340000 */
 /* Enable below CONFIG for fastboot */
 
-/* To use usb fastboot, you need to enable below Kconfig
- * CONFIG_USB, CONFIG_USB_GADGET and CONFIG_USB_GADGET_DWC2_OTG
+/* To use usb fastboot/UMS, enable the following Kconfig options in the
+ * board defconfig instead of ad-hoc macros here:
+ *   CONFIG_USB, CONFIG_USB_GADGET, CONFIG_USB_GADGET_DWC2_OTG,
+ *   CONFIG_USB_GADGET_DOWNLOAD, CONFIG_USB_GADGET_MANUFACTURER,
+ *   CONFIG_USB_GADGET_VENDOR_NUM, CONFIG_USB_GADGET_PRODUCT_NUM,
+ *   and CONFIG_USB_FUNCTION_FASTBOOT / CONFIG_CMD_USB_MASS_STORAGE.
  */
-
-#ifdef CONFIG_USB_GADGET
-#define CONFIG_USB_FUNCTION_FASTBOOT
-#define CONFIG_USB_GADGET_DOWNLOAD
-#define CONFIG_G_DNL_MANUFACTURER "Cvitek"
-#define CONFIG_G_DNL_VENDOR_NUM   0x18d1
-#define CONFIG_G_DNL_PRODUCT_NUM 0x4ee0
-#endif
 
 #define CONFIG_IPADDR			192.168.0.3
 #define CONFIG_NETMASK			255.255.255.0
