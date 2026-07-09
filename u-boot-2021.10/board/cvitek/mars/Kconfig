@@ -54,7 +54,8 @@ config CVITEK_SPI_FLASH
 config ENV_SIZE
     default 0x10000 if ENV_IS_IN_SPI_FLASH
     default 0x20000 if ENV_IS_IN_MMC
-	default 0x20000 if ENV_IS_IN_NAND
+    default 0x20000 if ENV_IS_IN_NAND
+    default 0x20000 if ENV_IS_IN_FAT
 
 config ENV_SECT_SIZE
 	default 0x10000 if ENV_IS_IN_SPI_FLASH

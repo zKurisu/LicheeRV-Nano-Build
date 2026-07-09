@@ -55,8 +55,14 @@ def gen_cvipart_h(output, parser):
         else:
             # If no ENV or U-BOOT ENV has been set in partition.xml, we assume
             # there is no env support
+            # of.write("#ifndef CONFIG_ENV_IS_NOWHERE\n#define CONFIG_ENV_IS_NOWHERE\n#endif\n")
+            # of.write("#define CONFIG_ENV_SIZE 0x20000\n")
+            of.write("#if !defined(CONFIG_ENV_IS_IN_FAT) && !defined(CONFIG_ENV_IS_IN_MMC) && "
+                     "!defined(CONFIG_ENV_IS_IN_SPI_FLASH) && !defined(CONFIG_ENV_IS_IN_NAND)\n")
             of.write("#ifndef CONFIG_ENV_IS_NOWHERE\n#define CONFIG_ENV_IS_NOWHERE\n#endif\n")
-            of.write("#define CONFIG_ENV_SIZE 0x20000\n")
+            of.write("#endif\n")
+            of.write("#ifndef CONFIG_ENV_SIZE\n#define CONFIG_ENV_SIZE 0x20000\n#endif\n")
+
             env_exist = False
 
         if env_exist and "ENV_BAK" in parser.parts:
