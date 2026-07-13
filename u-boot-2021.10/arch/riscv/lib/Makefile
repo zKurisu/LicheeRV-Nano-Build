@@ -27,6 +27,11 @@ obj-$(CONFIG_$(SPL_)SMP) += smp.o
 obj-$(CONFIG_SPL_BUILD)	+= spl.o
 obj-y   += fdt_fixup.o
 
+# Soft-float stubs: compiled as rv64imac/lp64, but the assembler is told to
+# accept FPU opcodes via -Wa,-march=rv64imafdc.  The .o stays lp64 ABI.
+obj-y += softfloat.o
+CFLAGS_softfloat.o += -Wa,-march=rv64imafdc
+
 # For building EFI apps
 CFLAGS_NON_EFI := -fstack-protector-strong
 CFLAGS_$(EFI_CRT0) := $(CFLAGS_EFI)

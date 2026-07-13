@@ -21,6 +21,7 @@
 #include "mars_reg_fmux_gpio.h"
 #include "mars_pinlist_swconfig.h"
 #include <linux/delay.h>
+#include <net.h>
 #include <bootstage.h>
 
 #if defined(__riscv)
@@ -336,6 +337,66 @@ int board_usb_init(int index, enum usb_init_type init)
 	return dwc2_udc_probe(&cv182x_otg_data);
 }
 #endif
+
+#ifdef CONFIG_DM_USB_GADGET
+/* Forward declaration for DWC2 UDC structure */
+struct dwc2_udc;
+
+/*
+ * Override weak otg_phy_init to re-apply PHY configuration on every gadget
+ * re-initialization. Without this override, the DM path only configures the
+ * PHY once at boot. Subsequent _usb_eth_init() calls (e.g., ping followed by
+ * tftpboot) would skip the PHY init because the DM path caches the UDC device
+ * and otg_phy_init's weak default is a no-op.
+ *
+ * NOTE: Do NOT toggle BIT_TOP_SOFT_RST_USB here - the system-level USB
+ * controller reset is too aggressive when run right before reconfig_usbd().
+ * The DWC2 CORE_SOFT_RESET in reconfig_usbd() handles the DWC2 core reset.
+ * We only need to re-apply the PHY and ECO settings.
+ */
+void otg_phy_init(struct dwc2_udc *dev)
+{
+	uint32_t val;
+
+	/* Set USB PHY: external VBUS, ID override (force peripheral mode) */
+	val = mmio_read_32(REG_TOP_USB_PHY_CTRL);
+	mmio_write_32(REG_TOP_USB_PHY_CTRL, val | BIT_TOP_USB_PHY_CTRL_EXTVBUS
+			| USB_PHY_ID_OVERRIDE_ENABLE | USB_PHY_ID_VALUE);
+
+	/* Enable ECO RX flush (workaround for RX stall) */
+	mmio_write_32(REG_TOP_USB_ECO, mmio_read_32(REG_TOP_USB_ECO) | BIT_TOP_USB_ECO_RX_FLUSH);
+}
+
+int board_late_init(void)
+{
+	uint32_t val;
+
+	/* USB controller reset */
+	val = mmio_read_32(TOP_BASE + REG_TOP_SOFT_RST) & (~BIT_TOP_SOFT_RST_USB);
+	mmio_write_32(TOP_BASE + REG_TOP_SOFT_RST, val);
+	udelay(50);
+	val = mmio_read_32(TOP_BASE + REG_TOP_SOFT_RST) | BIT_TOP_SOFT_RST_USB;
+	mmio_write_32(TOP_BASE + REG_TOP_SOFT_RST, val);
+
+	/* Set USB PHY: external VBUS, ID override */
+	val = mmio_read_32(REG_TOP_USB_PHY_CTRL);
+	mmio_write_32(REG_TOP_USB_PHY_CTRL, val | BIT_TOP_USB_PHY_CTRL_EXTVBUS
+			| USB_PHY_ID_OVERRIDE_ENABLE | USB_PHY_ID_VALUE);
+
+	/* Enable ECO RX flush */
+	mmio_write_32(REG_TOP_USB_ECO, mmio_read_32(REG_TOP_USB_ECO) | BIT_TOP_USB_ECO_RX_FLUSH);
+
+	/* Bind USB Ethernet gadget to UCLASS_ETH */
+	usb_ether_init();
+
+	/* Initialize USB gadget in persistent mode at boot time.
+	 * This makes the USB Ethernet device visible to the host immediately
+	 * and keeps it alive across network commands. */
+	usb_eth_init_boot();
+
+	return 0;
+}
+#endif /* CONFIG_DM_USB_GADGET */
 
 void board_save_time_record(uintptr_t saveaddr)
 {

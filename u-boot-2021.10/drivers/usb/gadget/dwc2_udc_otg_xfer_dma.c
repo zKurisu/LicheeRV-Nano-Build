@@ -181,6 +181,15 @@ static int setdma_tx(struct dwc2_ep *ep, struct dwc2_request *req)
 
 	writel(DEPCTL_EPENA|DEPCTL_CNAK|ctrl, &reg->in_endp[ep_num].diepctl);
 
+	{
+		u32 ctl = readl(&reg->in_endp[ep_num].diepctl);
+		debug("TX_DMA: EP%d DIEPCTL=0x%08x TXFNUM=%d DIEPDMA=0x%x DIEPTSIZ=0x%x len=%d buf=%p\n",
+		       ep_num, ctl, (ctl >> 22) & 0xf,
+		       readl(&reg->in_endp[ep_num].diepdma),
+		       readl(&reg->in_endp[ep_num].dieptsiz),
+		       length, buf);
+	}
+
 	debug_cond(DEBUG_IN_EP,
 		"%s:EP%d TX DMA start : DIEPDMA0 = 0x%x,"
 		"DIEPTSIZ0 = 0x%x, DIEPCTL0 = 0x%x\n"
@@ -246,6 +255,9 @@ static void complete_rx(struct dwc2_udc *dev, u8 ep_num)
 		   is_short, ep_tsr, req->req.length - req->req.actual);
 
 	if (is_short || req->req.actual == req->req.length) {
+		if (ep_num != 0)
+			debug("  -> EP%d OUT: RX done, xfer=%d, actual=%d/%d, is_short=%d\n",
+			       ep_num, xfer_size, req->req.actual, req->req.length, is_short);
 		if (ep_num == EP0_CON && dev->ep0state == DATA_STATE_RECV) {
 			debug_cond(DEBUG_OUT_EP != 0, "	=> Send ZLP\n");
 			dwc2_udc_ep0_zlp(dev);
@@ -332,8 +344,12 @@ static void complete_tx(struct dwc2_udc *dev, u8 ep_num)
 		return;
 	}
 
-	if (req->req.actual == req->req.length)
+	if (req->req.actual == req->req.length) {
+		if (ep_num != 0)
+			debug("  -> EP%d IN: TX done, actual=%d/%d, len=%d\n",
+			       ep_num, req->req.actual, req->req.length, ep->len);
 		done(ep, req, 0);
+	}
 
 	if (!list_empty(&ep->queue)) {
 		req = list_entry(ep->queue.next, struct dwc2_request, queue);
@@ -387,6 +403,11 @@ static void process_ep_in_intr(struct dwc2_udc *dev)
 			debug_cond(DEBUG_IN_EP,
 				   "\tEP%d-IN : DIEPINT = 0x%x\n",
 				   ep_num, ep_intr_status);
+
+			if (ep_num != 0)
+				debug("  -> EP%d IN: DIEPINT=0x%08x DIEPTSIZ=0x%08x\n",
+				       ep_num, ep_intr_status,
+				       readl(&reg->in_endp[ep_num].dieptsiz));
 
 			/* Interrupt Clear */
 			writel(ep_intr_status, &reg->in_endp[ep_num].diepint);
@@ -443,10 +464,14 @@ static void process_ep_out_intr(struct dwc2_udc *dev)
 			writel(ep_intr_status, &reg->out_endp[ep_num].doepint);
 
 			if (ep_num == 0) {
+				debug("  -> EP0: DOEPINT=0x%08x (DOEPTSIZ=0x%08x)\n",
+				       ep_intr_status, readl(&epsiz_reg));
+
 				if (ep_intr_status & TRANSFER_DONE) {
 					ep_tsr = readl(&epsiz_reg);
 					xfer_size = ep_tsr &
 						   DOEPT_SIZ_XFER_SIZE_MAX_EP0;
+					debug("  -> EP0: TRANSFER_DONE xfer_sz=%d\n", xfer_size);
 
 					if (xfer_size == req_size &&
 					    dev->ep0state == WAIT_FOR_SETUP) {
@@ -462,8 +487,7 @@ static void process_ep_out_intr(struct dwc2_udc *dev)
 
 				if (ep_intr_status &
 				    CTRL_OUT_EP_SETUP_PHASE_DONE) {
-					debug_cond(DEBUG_OUT_EP != 0,
-						   "SETUP packet arrived\n");
+					debug("  -> EP0: SETUP_PHASE_DONE\n");
 					dwc2_handle_ep0(dev);
 				}
 			} else {
@@ -491,6 +515,9 @@ static int dwc2_udc_irq(int irq, void *_dev)
 	intr_status = readl(&reg->gintsts);
 	gintmsk = readl(&reg->gintmsk);
 
+	debug("\nDWC2 IRQ: GINTSTS=0x%08x state=%s DAINT=0x%08x\n",
+	       intr_status, state_names[dev->ep0state], readl(&reg->daint));
+
 	debug_cond(DEBUG_ISR,
 		  "\n*** %s : GINTSTS=0x%x(on state %s), GINTMSK : 0x%x,"
 		  "DAINT : 0x%x, DAINTMSK : 0x%x\n",
@@ -509,11 +536,13 @@ static int dwc2_udc_irq(int irq, void *_dev)
 		usb_status = (readl(&reg->dsts) & 0x6);
 
 		if (usb_status & (USB_FULL_30_60MHZ | USB_FULL_48MHZ)) {
+			debug("  -> ENUMDONE: Full Speed\n");
 			debug_cond(DEBUG_ISR,
 				   "\t\tFull Speed Detection\n");
 			set_max_pktsize(dev, USB_SPEED_FULL);
 
 		} else {
+			debug("  -> ENUMDONE: High Speed\n");
 			debug_cond(DEBUG_ISR,
 				"\t\tHigh Speed Detection : 0x%x\n",
 				usb_status);
@@ -570,15 +599,12 @@ static int dwc2_udc_irq(int irq, void *_dev)
 
 	if (intr_status & INT_RESET) {
 		usb_status = readl(&reg->gotgctl);
-		debug_cond(DEBUG_ISR,
-			"\tReset interrupt - (GOTGCTL):0x%x\n", usb_status);
+		debug("  -> RESET: GOTGCTL=0x%x\n", usb_status);
 		writel(INT_RESET, &reg->gintsts);
 
 		if ((usb_status & 0xc0000) == (0x3 << 18)) {
 			if (reset_available) {
-				debug_cond(DEBUG_ISR,
-					"\t\tOTG core got reset (%d)!!\n",
-					reset_available);
+				debug("  -> RESET: reconfiguring\n");
 				reconfig_usbd(dev);
 				dev->ep0state = WAIT_FOR_SETUP;
 				reset_available = 0;
@@ -588,16 +614,19 @@ static int dwc2_udc_irq(int irq, void *_dev)
 
 		} else {
 			reset_available = 1;
-			debug_cond(DEBUG_ISR,
-				   "\t\tRESET handling skipped\n");
+			debug("  -> RESET: skipped (no B-session valid)\n");
 		}
 	}
 
-	if (intr_status & INT_IN_EP)
+	if (intr_status & INT_IN_EP) {
+		debug("  -> IN EP IRQ\n");
 		process_ep_in_intr(dev);
+	}
 
-	if (intr_status & INT_OUT_EP)
+	if (intr_status & INT_OUT_EP) {
+		debug("  -> OUT EP IRQ\n");
 		process_ep_out_intr(dev);
+	}
 
 	spin_unlock_irqrestore(&dev->lock, flags);
 

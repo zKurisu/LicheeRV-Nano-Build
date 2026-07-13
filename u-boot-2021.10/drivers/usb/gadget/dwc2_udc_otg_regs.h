@@ -120,10 +120,6 @@ struct dwc2_usbotg_reg {
 #define CSFTRST_DONE		(0x1<<29)
 #define CORE_SOFT_RESET		(0x1<<0)
 
-/* Core release (GSNPSID) */
-#define DWC2_CORE_REV_4_20a	0x4f54420a
-#define DWC2_CORE_REV_MASK	0x0000ffff
-
 /* DWC2_UDC_OTG_GINTSTS/DWC2_UDC_OTG_GINTMSK core interrupt register */
 #define INT_RESUME			(1u<<31)
 #define INT_DISCONN			(0x1<<29)

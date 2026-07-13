@@ -41,9 +41,7 @@
 #include <asm/unaligned.h>
 #include <asm/io.h>
 
-#ifdef CONFIG_ARM
 #include <asm/mach-types.h>
-#endif
 
 #include <power/regulator.h>
 
@@ -175,15 +173,7 @@ __weak void otg_phy_off(struct dwc2_udc *dev) {}
  */
 static void udc_disable(struct dwc2_udc *dev)
 {
-	u32 uTemp;
-
 	debug_cond(DEBUG_SETUP != 0, "%s: %p\n", __func__, dev);
-
-	/* Soft-disconnect: drive D+ low so the host detects removal. */
-	uTemp = readl(&reg->dctl);
-	uTemp |= SOFT_DISCONNECT;
-	writel(uTemp, &reg->dctl);
-	mdelay(10);
 
 	udc_set_address(dev, 0);
 
@@ -364,6 +354,20 @@ static int dwc2_gadget_stop(struct usb_gadget *g)
 	return 0;
 }
 
+static int dwc2_pullup(struct usb_gadget *gadget, int is_on)
+{
+	u32 dctl;
+
+	dctl = readl(&reg->dctl);
+	if (is_on)
+		dctl &= ~SOFT_DISCONNECT;
+	else
+		dctl |= SOFT_DISCONNECT;
+	writel(dctl, &reg->dctl);
+
+	return 0;
+}
+
 #endif /* !CONFIG_IS_ENABLED(DM_USB_GADGET) */
 
 /*
@@ -471,49 +475,43 @@ static void reconfig_usbd(struct dwc2_udc *dev)
 	u32 max_hw_ep;
 	int pdata_hw_ep;
 
-	/* Core soft reset. DWC2 >= 4.20a signals completion via CSFTRST_DONE
-	 * (bit29) instead of self-clearing CSFTRST (bit0). */
-	{
-		u32 snpsid = readl((void *)((uintptr_t)reg + 0x040)) &
-			     DWC2_CORE_REV_MASK;
-		u32 greset;
-		int count = 0;
+	debug("Reseting OTG controller\n");
 
-		if (snpsid < (DWC2_CORE_REV_4_20a & DWC2_CORE_REV_MASK)) {
-			writel(CORE_SOFT_RESET, &reg->grstctl);
-			do {
-				udelay(1);
-				greset = readl(&reg->grstctl);
-				if (++count > 100000) {
-					printf("reconfig_usbd: HANG soft reset GRSTCTL=%08x\n",
-					       greset);
-					break;
-				}
-			} while (greset & CORE_SOFT_RESET);
-		} else {
-			writel(CORE_SOFT_RESET, &reg->grstctl);
-			do {
-				udelay(1);
-				greset = readl(&reg->grstctl);
-				if (++count > 100000) {
-					printf("reconfig_usbd: HANG soft reset(4.2) GRSTCTL=%08x\n",
-					       greset);
-					break;
-				}
-			} while (!(greset & CSFTRST_DONE));
+	/* Trigger core soft reset and wait for completion */
+	{
+		int reset_cnt;
+		u32 greset;
+
+		writel(CORE_SOFT_RESET, &reg->grstctl);
+
+		/* Wait for reset to complete (old core: bit 0 clears,
+		 * new core >= 4.20a: bit 29 CSFTRST_DONE sets)
+		 */
+		reset_cnt = 0;
+		do {
+			udelay(1);
 			greset = readl(&reg->grstctl);
+			if (++reset_cnt > 50) {
+				printf("reconfig: CORE_SOFT_RESET timeout! GRSTCTL=0x%08x\n",
+				       greset);
+				break;
+			}
+		} while ((greset & CORE_SOFT_RESET) && !(greset & CSFTRST_DONE));
+
+		/* New cores (>= 4.20a): clear CSFTRST_DONE flag */
+		if (greset & CSFTRST_DONE) {
 			greset &= ~CORE_SOFT_RESET;
 			greset |= CSFTRST_DONE;
 			writel(greset, &reg->grstctl);
 		}
 
-		/* Wait for AHB master IDLE state. */
-		count = 0;
+		/* Wait for AHB master IDLE state */
+		reset_cnt = 0;
 		do {
 			udelay(1);
 			greset = readl(&reg->grstctl);
-			if (++count > 100000) {
-				printf("reconfig_usbd: HANG AHB idle GRSTCTL=%08x\n",
+			if (++reset_cnt > 50) {
+				printf("reconfig: AHB_IDLE timeout! GRSTCTL=0x%08x\n",
 				       greset);
 				break;
 			}
@@ -538,6 +536,9 @@ static void reconfig_usbd(struct dwc2_udc *dev)
 
 	if (dev->pdata->usb_gusbcfg)
 		dflt_gusbcfg = dev->pdata->usb_gusbcfg;
+
+	debug("reconfig_usbd: GUSBCFG=0x%08x (rx_fifo=%d np_tx=%d)\n",
+	       dflt_gusbcfg, dev->pdata->rx_fifo_sz, dev->pdata->np_tx_fifo_sz);
 
 	writel(dflt_gusbcfg, &reg->gusbcfg);
 
@@ -864,6 +865,7 @@ static const struct usb_gadget_ops dwc2_udc_ops = {
 #if CONFIG_IS_ENABLED(DM_USB_GADGET)
 	.udc_start		= dwc2_gadget_start,
 	.udc_stop		= dwc2_gadget_stop,
+	.pullup			= dwc2_pullup,
 #endif
 };
 
@@ -902,8 +904,8 @@ static struct dwc2_udc memory = {
 		.bEndpointAddress = USB_DIR_IN | 1,
 		.bmAttributes = USB_ENDPOINT_XFER_BULK,
 
-		.ep_type = ep_bulk_out,
-		.fifo_num = 1,
+		.ep_type = ep_bulk_in,
+		.fifo_num = 0,   /* Bulk IN uses NP TX FIFO (FIFO 0) */
 	},
 
 	.ep[2] = {
@@ -917,7 +919,7 @@ static struct dwc2_udc memory = {
 		.bEndpointAddress = USB_DIR_OUT | 2,
 		.bmAttributes = USB_ENDPOINT_XFER_BULK,
 
-		.ep_type = ep_bulk_in,
+		.ep_type = ep_bulk_out,
 		.fifo_num = 2,
 	},
 
@@ -952,6 +954,7 @@ int dwc2_udc_probe(struct dwc2_plat_otg_data *pdata)
 
 	reg = (struct dwc2_usbotg_reg *)pdata->regs_otg;
 
+	dev->gadget.name = "dwc2-udc";
 	dev->gadget.is_dualspeed = 1;	/* Hack only*/
 	dev->gadget.is_otg = 0;
 	dev->gadget.is_a_peripheral = 0;
@@ -981,8 +984,11 @@ int dwc2_udc_handle_interrupt(void)
 	u32 intr_status = readl(&reg->gintsts);
 	u32 gintmsk = readl(&reg->gintmsk);
 
-	if (intr_status & gintmsk)
+	if (intr_status & gintmsk) {
+		debug("USB IRQ: GINTSTS=0x%08x GINTMSK=0x%08x\n",
+		       intr_status, gintmsk);
 		return dwc2_udc_irq(1, (void *)the_controller);
+	}
 
 	return 0;
 }
@@ -1094,6 +1100,16 @@ static void dwc2_set_stm32mp1_hsotg_params(struct dwc2_plat_otg_data *p)
 		p->usb_gusbcfg |= 1 << 30; /* FDMOD: Force device mode */
 }
 
+static void dwc2_set_cv182x_params(struct dwc2_plat_otg_data *p)
+{
+	p->usb_gusbcfg = 0x40081400;
+	/* Match non-DM working values: NP TX FIFO must be large enough
+	 * for EP0 control transfers (HS max packet = 64 bytes).
+	 * DT default of 32 is too small for reliable operation.
+	 */
+	p->np_tx_fifo_sz = 512;
+}
+
 static int dwc2_udc_otg_reset_init(struct udevice *dev,
 				   struct reset_ctl_bulk *resets)
 {
@@ -1148,6 +1164,10 @@ static int dwc2_udc_otg_probe(struct udevice *dev)
 	struct dwc2_usbotg_reg *usbotg_reg =
 		(struct dwc2_usbotg_reg *)plat->regs_otg;
 	int ret;
+
+	debug("dwc2_otg_probe: regs=0x%lx gusbcfg=0x%08x rx=%d nptx=%d txfifo_nb=%d\n",
+	       plat->regs_otg, plat->usb_gusbcfg, plat->rx_fifo_sz,
+	       plat->np_tx_fifo_sz, plat->tx_fifo_sz_nb);
 
 	ret = dwc2_udc_otg_clk_init(dev, &priv->clks);
 	if (ret)
@@ -1229,6 +1249,8 @@ static int dwc2_udc_otg_remove(struct udevice *dev)
 static const struct udevice_id dwc2_udc_otg_ids[] = {
 	{ .compatible = "snps,dwc2" },
 	{ .compatible = "brcm,bcm2835-usb" },
+	{ .compatible = "cvitek,cv182x-usb",
+	  .data = (ulong)dwc2_set_cv182x_params },
 	{ .compatible = "st,stm32mp15-hsotg",
 	  .data = (ulong)dwc2_set_stm32mp1_hsotg_params },
 	{},
