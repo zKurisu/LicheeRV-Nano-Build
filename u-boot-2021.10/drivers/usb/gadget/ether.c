@@ -22,7 +22,7 @@
 #include <malloc.h>
 #include <memalign.h>
 #include <linux/ctype.h>
-
+#include <linux/delay.h>
 #include "gadget_chips.h"
 #include "rndis.h"
 
@@ -93,7 +93,10 @@ static const char driver_desc[] = DRIVER_DESC;
 			|USB_CDC_PACKET_TYPE_PROMISCUOUS \
 			|USB_CDC_PACKET_TYPE_DIRECTED)
 
-#define USB_CONNECT_TIMEOUT (3 * CONFIG_SYS_HZ)
+#define USB_CONNECT_TIMEOUT (20 * CONFIG_SYS_HZ)
+
+/* Persistent mode: USB gadget stays alive between network commands */
+static int usb_eth_persistent;
 
 /*-------------------------------------------------------------------------*/
 
@@ -1546,7 +1549,13 @@ static int rx_submit(struct eth_dev *dev, struct usb_request *req,
 
 	retval = usb_ep_queue(dev->out_ep, req, gfp_flags);
 
-	if (retval)
+	/*
+	 * -EINVAL (-22) means the request is already on the endpoint queue.
+	 * This is expected in persistent mode when the RX request was
+	 * already armed by a previous usb_eth_free_pkt() → rx_submit().
+	 * Only report errors that indicate a real problem.
+	 */
+	if (retval && retval != -EINVAL)
 		pr_err("rx submit --> %d", retval);
 
 	return retval;
@@ -1562,11 +1571,11 @@ static void rx_complete(struct usb_ep *ep, struct usb_request *req)
 	case 0:
 		if (rndis_active(dev)) {
 			/* we know MaxPacketsPerTransfer == 1 here */
-			int length = rndis_rm_hdr(req->buf, req->actual);
-			if (length < 0)
+			int hdr_offs = rndis_rm_hdr(req->buf, req->actual);
+			if (hdr_offs < 0)
 				goto length_err;
-			req->length -= length;
-			req->actual -= length;
+			req->actual -= hdr_offs;
+			req->length = req->actual;
 		}
 		if (req->actual < ETH_HLEN || PKTSIZE_ALIGN < req->actual) {
 length_err:
@@ -2352,6 +2361,74 @@ static int _usb_eth_init(struct ether_priv *priv)
 	int ret;
 	unsigned long timeout = USB_CONNECT_TIMEOUT;
 
+	/*
+	 * Persistent mode: skip full initialization if gadget is already up.
+	 * Reset state variables, wait for the network if needed, and
+	 * re-submit the RX request.
+	 */
+	if (usb_eth_persistent && dev->gadget) {
+		packet_received = 0;
+		packet_sent = 0;
+		dev->tx_qlen = 0;
+		/* Process any pending interrupts */
+		usb_gadget_handle_interrupts(0);
+
+		/*
+		 * If the previous network command failed before the host
+		 * fully configured RNDIS (network_started == 0), we need to
+		 * force a USB disconnect/reconnect cycle.  This triggers
+		 * host re-enumeration and a fresh RNDIS handshake.
+		 *
+		 * Without the disconnect/reconnect, the host may have
+		 * already given up on RNDIS negotiation (its messages were
+		 * sent between network commands when U-Boot was not
+		 * servicing USB interrupts), and simply waiting for
+		 * network_started would time out indefinitely.
+		 *
+		 * The disconnect calls eth_reset_config() which frees
+		 * tx_req/rx_req and disables endpoints.  Re-enumeration
+		 * triggers eth_set_config() → set_ether_config() which
+		 * re-allocates everything and restarts RNDIS negotiation.
+		 */
+		if (!dev->network_started) {
+			usb_gadget_disconnect(dev->gadget);
+			udelay(5000);  /* let host detect disconnect */
+			usb_gadget_connect(dev->gadget);
+
+			ts = get_timer(0);
+			while (!dev->network_started) {
+				if (ctrlc() || (get_timer(ts) > timeout)) {
+					pr_err("The remote end did not respond in time.");
+					return -1;
+				}
+				usb_gadget_handle_interrupts(0);
+			}
+		}
+
+		/*
+		 * Re-arm the RX request if it is not already on the OUT
+		 * endpoint queue.  After the previous network command,
+		 * usb_eth_free_pkt() → rx_submit() may have already queued
+		 * it, in which case usb_ep_queue() returns -EINVAL (-22).
+		 * That is harmless — the request stays armed and will
+		 * continue to receive data from the host.
+		 *
+		 * If the request was completed by a DMA interrupt (host
+		 * sent data between network commands), the queue is clean
+		 * and rx_submit() will re-arm it normally.
+		 */
+		{
+			int rx_ret;
+
+			rx_ret = rx_submit(dev, dev->rx_req, 0);
+			if (rx_ret && rx_ret != -EINVAL) {
+				pr_err("rx_submit failed: %d", rx_ret);
+				return -1;
+			}
+		}
+		return 0;
+	}
+
 	ret = usb_gadget_initialize(0);
 	if (ret)
 		return ret;
@@ -2398,6 +2475,7 @@ static int _usb_eth_init(struct ether_priv *priv)
 	packet_sent = 0;
 
 	gadget = dev->gadget;
+	usb_gadget_disconnect(gadget);
 	usb_gadget_connect(gadget);
 
 	if (env_get("cdc_connect_timeout"))
@@ -2502,6 +2580,17 @@ static void _usb_eth_halt(struct ether_priv *priv)
 	/* If the gadget not registered, simple return */
 	if (!dev->gadget)
 		return;
+
+	/*
+	 * Persistent mode: keep USB gadget alive between network commands.
+	 * Only reset state variables, don't tear down the gadget or RNDIS.
+	 */
+	if (usb_eth_persistent) {
+		packet_received = 0;
+		packet_sent = 0;
+		dev->tx_qlen = 0;
+		return;
+	}
 
 	/*
 	 * Some USB controllers may need additional deinitialization here
@@ -2690,6 +2779,19 @@ int usb_ether_init(void)
 		return ret;
 	}
 
+	return 0;
+}
+
+/*
+ * Enable USB Ethernet gadget persistent mode at boot time.
+ * Called from board_late_init(). The actual USB gadget initialization
+ * happens during the first network command (ping/tftpboot/etc.).
+ * After that, the gadget stays alive across network commands.
+ */
+int usb_eth_init_boot(void)
+{
+	usb_eth_persistent = 1;
+	printf("USB Ethernet gadget persistent mode enabled\n");
 	return 0;
 }
 

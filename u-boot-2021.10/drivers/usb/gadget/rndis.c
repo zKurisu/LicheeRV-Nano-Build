@@ -1203,6 +1203,14 @@ void rndis_add_hdr(void *buf, int length)
 	memset(header, 0, sizeof *header);
 	header->MessageType = __constant_cpu_to_le32(REMOTE_NDIS_PACKET_MSG);
 	header->MessageLength = cpu_to_le32(length + sizeof *header);
+	/* Linux rndis_host driver does skb_pull(skb, 8 + data_offset)
+	 * and validates (data_offset + data_len + 8) <= msg_len.
+	 * Standard RNDIS header is 36 bytes (9 fields), U-Boot adds
+	 * VcHandle+Reserved (8 bytes) making 44, but DataOffset must
+	 * be 36 for the host kernel to compute the correct offset.
+	 *   Host pull: 8 + 36 = 44 = sizeof(struct rndis_packet_msg_type)
+	 *   Host check: 36 + data_len + 8 = 44 + data_len = msg_len ✓
+	 */
 	header->DataOffset = __constant_cpu_to_le32(36);
 	header->DataLength = cpu_to_le32(length);
 }
@@ -1277,15 +1285,17 @@ int rndis_rm_hdr(void *buf, int length)
 
 	/* DataOffset, DataLength */
 	offs = get_unaligned_le32(tmp++) + 8 /* offset of DataOffset */;
+	debug("RNDIS_RX: DataOff_raw=%d offs=%d len_in=%d sizeof_hdr=%d\n",
+		offs - 8, offs, length, (int)sizeof(struct rndis_packet_msg_type));
 	if (offs != sizeof(struct rndis_packet_msg_type))
-		debug("%s: unexpected DataOffset: %d\n", __func__, offs);
+		debug("RNDIS_RX: WARN unexpected DataOffset offs=%d\n", offs);
 	if (offs >= length)
 		return -EOVERFLOW;
 
 	len = get_unaligned_le32(tmp++);
 	if (len + sizeof(struct rndis_packet_msg_type) != length)
-		debug("%s: unexpected DataLength: %d, packet length=%d\n",
-				__func__, len, length);
+		debug("RNDIS_RX: WARN DataLength=%d != pktlen=%d-siz=%d\n",
+			len, length, (int)sizeof(struct rndis_packet_msg_type));
 
 	memmove(buf, buf + offs, len);
 
