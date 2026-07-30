@@ -22,6 +22,7 @@
 #include "mars_pinlist_swconfig.h"
 #include <linux/delay.h>
 #include <net.h>
+#include <g_dnl.h>
 #include <bootstage.h>
 
 #if defined(__riscv)
@@ -367,6 +368,26 @@ void otg_phy_init(struct dwc2_udc *dev)
 	mmio_write_32(REG_TOP_USB_ECO, mmio_read_32(REG_TOP_USB_ECO) | BIT_TOP_USB_ECO_RX_FLUSH);
 }
 
+/*
+ * Override g_dnl_bind_fixup to change the USB product ID when the composite
+ * gadget is used for UMS (USB Mass Storage).
+ *
+ * Both the RNDIS Ethernet gadget and the g_dnl composite gadget share
+ * CONFIG_USB_GADGET_VENDOR_NUM / CONFIG_USB_GADGET_PRODUCT_NUM (0x0525:0xA4A2
+ * = NetChip Ethernet/RNDIS Gadget).  Linux kernel drivers cdc_subset and
+ * rndis_host match on this VID/PID combination, so they will claim the USB
+ * device as a network interface even when UMS is presenting a Mass Storage
+ * interface (class 0x08).  Using a different PID (0xA4A5) for UMS prevents
+ * this misdetection — the host will correctly match usb-storage by interface
+ * class instead.
+ */
+int g_dnl_bind_fixup(struct usb_device_descriptor *dev, const char *name)
+{
+	if (!strcmp(name, "usb_dnl_ums"))
+		dev->idProduct = __constant_cpu_to_le16(0xA4A5);
+	return 0;
+}
+
 int board_late_init(void)
 {
 	uint32_t val;
@@ -391,8 +412,20 @@ int board_late_init(void)
 
 	/* Initialize USB gadget in persistent mode at boot time.
 	 * This makes the USB Ethernet device visible to the host immediately
-	 * and keeps it alive across network commands. */
-	usb_eth_init_boot();
+	 * and keeps it alive across network commands.
+	 *
+	 * Set env "usb_eth_persistent=0" to disable persistent mode,
+	 * which frees the USB device controller after each network command.
+	 * This allows the UMS command (ums 0 mmc 0) to take over the USB port.
+	 *
+	 * Default (no env or any value other than "0"): persistent mode ON.
+	 */
+	{
+		const char *p = env_get("usb_eth_persistent");
+
+		if (!p || p[0] != '0')
+			usb_eth_init_boot();
+	}
 
 	return 0;
 }
