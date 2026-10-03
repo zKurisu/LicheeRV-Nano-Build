@@ -50,6 +50,9 @@
 #define CMDQU_CMD_SET_REPORT     0x60U
 /* 大核用来开关"小核侧 UART1 链路测试"的命令号（0=关、1=握手模式） */
 #define CMDQU_CMD_UART1_MODE     0x61U
+/* M3 第 3 步：周期控制。0x62 设目标速度（并以心跳维持），0x63 设控制周期 */
+#define CMDQU_CMD_SET_TARGET      0x62U
+#define CMDQU_CMD_SET_CTRL_PERIOD 0x63U
 /* 最小上报周期：本固件 tick 为 200 Hz（5 ms），更小的值会被 pdMS_TO_TICKS 算成 0 */
 #define CMDQU_MIN_PERIOD_MS      5U
 /* 环消息类型：状态快照 */
@@ -58,6 +61,8 @@
 #define CMDQU_MSG_UART_LINK      6U
 /* 环消息类型：UART1 命令自检（mode>=2 时每秒上报） */
 #define CMDQU_MSG_UART_PROBE     7U
+/* 环消息类型：UART1 周期控制状态（mode>=3 时每秒上报） */
+#define CMDQU_MSG_UART_CTRL      8U
 
 /****************************************************************************
  * 小核侧 UART1：直接与底盘控制板对话（焊盘 A18/A19）
@@ -78,11 +83,36 @@
 #define CMDQU_MOTOR_CMD_CONFIG   0x02U
 #define CMDQU_MOTOR_CMD_SET_SPEED 0x10U
 #define CMDQU_MOTOR_CMD_STOP     0x11U
+#define CMDQU_MOTOR_CMD_GET_STATUS 0x21U
 #define CMDQU_MOTOR_RSP_ACK      0x80U
 #define CMDQU_MOTOR_RSP_NACK     0x81U
+#define CMDQU_MOTOR_RSP_STATUS   0x91U
 /* 自检步骤数：CONFIG / SET_SPEED(0,0) / SET_SPEED(1,0) / STOP(0) / STOP(1) */
 #define CMDQU_UART1_PROBE_STEPS  5U
 #define CMDQU_UART1_PROBE_GAP_MS 300U
+	/* 周期控制的节拍与安全阈值 */
+#define CMDQU_UART1_TICK_MS      5U   /* 任务基础节拍 = 1 个 tick（200 Hz） */
+#define CMDQU_UART1_WD_MS        500U /* 大核心跳超时：超过它就自动停车 */
+#define CMDQU_UART1_CTRL_DEF_MS  100U /* 默认控制周期 */
+#define CMDQU_UART1_STATUS_EVERY 5U   /* 每 N 个控制周期读一次状态/转速 */
+#define CMDQU_UART1_PWM_LIMIT    150  /* 目标 PWM 限幅（与 AKA-00 的 speed_scale 一致） */
+
+/* UART1 周期控制状态，作为 kind=8 的环消息载荷（mode>=3 时每秒一条）。
+ * 48 字节正好占满环消息载荷。 */
+struct cmdqu_uart_ctrl {
+	unsigned int seq;
+	unsigned int mode;
+	unsigned int period_ms;     /* 当前控制周期 */
+	unsigned int target_lr;     /* 目标：低 16 = 左轮 PWM(i16)，高 16 = 右轮 PWM(i16) */
+	unsigned int ctrl_count;    /* 已完成的控制周期数 */
+	unsigned int ack_total;     /* 该链路收到的 ACK 总数 */
+	unsigned int wd_stops;      /* 心跳超时自动停车的次数 */
+	unsigned int dt_max_ticks;  /* 本秒内控制周期实测最大值（tick，正常恒等于周期） */
+	unsigned int ch_state;      /* 底盘板回包里的状态机：0 未初始化/1 空闲/2 就绪/3 运行/4 错误 */
+	int rpm_l;                  /* 底盘板回包的左轮转速 */
+	int rpm_r;                  /* 底盘板回包的右轮转速 */
+	unsigned int reserved;
+};
 #define CMDQU_UART1_RBR_THR      0x00U
 #define CMDQU_UART1_IER_DLM      0x04U
 #define CMDQU_UART1_FCR_IIR      0x08U
@@ -144,6 +174,21 @@ static volatile unsigned int g_cmdqu_uart1_last_sent = 0U;
 static volatile unsigned int g_cmdqu_uart1_last_reply = 0U; /* 合法帧的命令号 */
 static volatile unsigned int g_cmdqu_uart1_last_echo = 0U;  /* ACK/NACK 回显的命令号 */
 static volatile unsigned int g_cmdqu_uart1_replies = 0U;    /* 收到的 ACK+NACK 总数 */
+/* 周期控制（mode>=3）：目标、心跳、控制周期与实测节拍 */
+static volatile unsigned int g_cmdqu_uart1_ctrl_seq = 0U;
+static volatile unsigned int g_cmdqu_uart1_ctrl_period_ms = CMDQU_UART1_CTRL_DEF_MS;
+static volatile unsigned int g_cmdqu_uart1_target_lr = 0U; /* 低 16 = 左 i16，高 16 = 右 i16 */
+static volatile unsigned int g_cmdqu_uart1_target_set = 0U;
+static volatile unsigned int g_cmdqu_uart1_ctrl_count = 0U;
+static volatile unsigned int g_cmdqu_uart1_wd_stops = 0U;
+static volatile unsigned int g_cmdqu_uart1_dt_max = 0U;    /* 本秒内控制周期最大值（tick） */
+static volatile unsigned int g_cmdqu_uart1_ch_state = 0xFFU; /* 底盘回包里的状态机 */
+static volatile int g_cmdqu_uart1_rpm_l = 0;
+static volatile int g_cmdqu_uart1_rpm_r = 0;
+/* 最近一条非 ACK 帧的载荷（GET_STATUS 的 5 字节用得上） */
+static volatile unsigned int g_cmdqu_uart1_reply_cmd = 0U;
+static volatile unsigned int g_cmdqu_uart1_reply_len = 0U;
+static volatile unsigned char g_cmdqu_uart1_reply_payload[8];
 
 /* 上报周期（毫秒）与自增序号，仅本文件使用 */
 static volatile unsigned int g_cmdqu_report_period_ms = 1000U;
@@ -435,8 +480,49 @@ void prvCmdQuRunTask(void *pvParameters)
 				if (rtos_cmdq.param_ptr > 2U)
 					g_cmdqu_uart1_mode = 2U; /* 只定义 0/1/2，越界按最大档处理 */
 				else
-					g_cmdqu_uart1_mode = rtos_cmdq.param_ptr;
+				g_cmdqu_uart1_mode = rtos_cmdq.param_ptr;
 				rtos_cmdq.param_ptr = g_cmdqu_uart1_mode;
+				goto send_label;
+			case CMDQU_CMD_SET_TARGET:
+				/* 下发目标速度：param 低 16 位是左轮 PWM(i16)，高 16 位是右轮 PWM(i16)。
+				 *
+				 * 这个命令同时充当**心跳**：小核那边超过 CMDQU_UART1_WD_MS(500 ms)
+				 * 没收到新的目标就会自动停车。也就是说"大核停止喂目标"= 车停，
+				 * 而不是像原来那样保持最后的速度一直跑。
+				 *
+				 * 收到目标即进入 mode=3（周期控制），大核不必再单独发 0x61。 */
+				{
+					/* 限幅：两个 16 位分量各自钳到 ±CMDQU_UART1_PWM_LIMIT。
+					 * 宁可停在边界上，也不把超量程 PWM 送给底盘板。 */
+					int l = (short)(rtos_cmdq.param_ptr & 0xFFFFU);
+					int r = (short)(rtos_cmdq.param_ptr >> 16);
+
+					if (l > CMDQU_UART1_PWM_LIMIT)
+						l = CMDQU_UART1_PWM_LIMIT;
+					if (l < -CMDQU_UART1_PWM_LIMIT)
+						l = -CMDQU_UART1_PWM_LIMIT;
+					if (r > CMDQU_UART1_PWM_LIMIT)
+						r = CMDQU_UART1_PWM_LIMIT;
+					if (r < -CMDQU_UART1_PWM_LIMIT)
+						r = -CMDQU_UART1_PWM_LIMIT;
+					g_cmdqu_uart1_target_lr =
+						((unsigned int)(unsigned short)l) |
+						(((unsigned int)(unsigned short)r) << 16);
+				}
+				g_cmdqu_uart1_target_set = 1U;
+				g_cmdqu_uart1_wd_stops = 0U;
+				if (g_cmdqu_uart1_mode < 3U)
+					g_cmdqu_uart1_mode = 3U;
+				rtos_cmdq.param_ptr = g_cmdqu_uart1_target_lr;
+				goto send_label;
+			case CMDQU_CMD_SET_CTRL_PERIOD:
+				/* 控制周期（毫秒），按基础节拍量化：最小 5 ms、最大 1000 ms */
+				g_cmdqu_uart1_ctrl_period_ms = rtos_cmdq.param_ptr;
+				if (g_cmdqu_uart1_ctrl_period_ms < CMDQU_UART1_TICK_MS)
+					g_cmdqu_uart1_ctrl_period_ms = CMDQU_UART1_TICK_MS;
+				if (g_cmdqu_uart1_ctrl_period_ms > 1000U)
+					g_cmdqu_uart1_ctrl_period_ms = 1000U;
+				rtos_cmdq.param_ptr = g_cmdqu_uart1_ctrl_period_ms;
 				goto send_label;
 			case SYS_CMD_INFO_LINUX:
 			default:
@@ -769,6 +855,12 @@ static unsigned int cmdqu_uart1_parse(unsigned char *buf, unsigned int *n,
 	if (acc == buf[4U + len]) {
 		g_cmdqu_uart1_last_reply = buf[2];
 		g_cmdqu_uart1_last_echo = (len >= 1U) ? buf[4] : 0U;
+		g_cmdqu_uart1_reply_cmd = buf[2];
+		g_cmdqu_uart1_reply_len = (len > sizeof(g_cmdqu_uart1_reply_payload))
+						 ? sizeof(g_cmdqu_uart1_reply_payload)
+						 : len;
+		for (i = 0U; i < g_cmdqu_uart1_reply_len; i++)
+			g_cmdqu_uart1_reply_payload[i] = buf[4U + i];
 		if (buf[2] == CMDQU_MOTOR_RSP_ACK) {
 			g_cmdqu_uart1_ack++;
 			g_cmdqu_uart1_last_ack_us = now_us;
@@ -821,11 +913,19 @@ void prvCmdquUart1Task(void *pvParameters)
 	unsigned int prev_replies = 0U;
 	unsigned long long probe_wait_ms = 0ULL;
 	unsigned int probe_answered = 0U;
+	unsigned int ctrl_div = 0U;       /* 基础节拍累加器，凑够一个控制周期 */
+	unsigned int dt_prev_tick = 0U;   /* 上一次控制帧所在 tick，用来量实测周期 */
+	unsigned int ctrl_cfg_sent = 0U;  /* 周期控制模式下是否已经发过 CMD_CONFIG */
+	unsigned long long wd_deadline_ms = 0ULL;
+	unsigned int wd_tripped = 0U;
+	TickType_t last_wake = xTaskGetTickCount();
 
 	(void)pvParameters;
 
 	for (;;) {
-		vTaskDelay(pdMS_TO_TICKS(10U));
+		/* 基础节拍 1 个 tick：既够频繁地抽干 RX FIFO（一个周期最多 ~20 字节），
+		 * 又让控制周期只能是 5 ms 的整数倍——**量化是固定的相位偏移，不是抖动**。 */
+		vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CMDQU_UART1_TICK_MS));
 		now_ms = (unsigned long long)xTaskGetTickCount() * (1000U / configTICK_RATE_HZ);
 
 		if (g_cmdqu_uart1_mode == 0U) {
@@ -849,6 +949,18 @@ void prvCmdquUart1Task(void *pvParameters)
 				g_cmdqu_uart1_last_echo = 0U;
 				g_cmdqu_uart1_replies = 0U;
 				prev_replies = 0U;
+				g_cmdqu_uart1_target_set = 0U;
+				g_cmdqu_uart1_target_lr = 0U;
+				g_cmdqu_uart1_ctrl_count = 0U;
+				g_cmdqu_uart1_wd_stops = 0U;
+				g_cmdqu_uart1_dt_max = 0U;
+				g_cmdqu_uart1_ch_state = 0xFFU;
+				g_cmdqu_uart1_rpm_l = 0;
+				g_cmdqu_uart1_rpm_r = 0;
+				ctrl_div = 0U;
+				dt_prev_tick = 0U;
+				wd_tripped = 0U;
+				ctrl_cfg_sent = 0U;
 			}
 			continue;
 		}
@@ -917,9 +1029,99 @@ void prvCmdquUart1Task(void *pvParameters)
 		}
 
 		/* 发：未握手 500 ms 重试；已握手 5 s 保活 */
-		if (now_ms - last_send_ms >= (g_cmdqu_uart1_ack ? 5000ULL : 500ULL)) {
+		if (g_cmdqu_uart1_ack == 0U) {
+			if (now_ms - last_send_ms >= 500ULL) {
+				cmdqu_uart1_send_init();
+				last_send_ms = now_ms;
+			}
+		} else if (g_cmdqu_uart1_mode < 3U && now_ms - last_send_ms >= 5000ULL) {
+			/* 只握手/自检时才发保活 INIT：底盘板收到 INIT 会回到 IDLE，
+			 * 周期控制模式下这会打断正在跑的控制，所以那一档不发。 */
 			cmdqu_uart1_send_init();
 			last_send_ms = now_ms;
+		}
+
+		/* mode>=3：周期控制。每个控制周期下发一次目标速度；大核心跳超时则自动停车。 */
+		if (g_cmdqu_uart1_mode >= 3U) {
+			unsigned int div = g_cmdqu_uart1_ctrl_period_ms / CMDQU_UART1_TICK_MS;
+
+			if (div == 0U)
+				div = 1U;
+			if (++ctrl_div >= div) {
+				unsigned int tick_now = (unsigned int)xTaskGetTickCount();
+				unsigned int sent_this_cycle = 0U;
+
+				ctrl_div = 0U;
+				/* 实测控制周期（tick）：固定量化不算抖动，这个值应当恒等于 div */
+				if (dt_prev_tick != 0U) {
+					unsigned int dt = tick_now - dt_prev_tick;
+
+					if (dt > g_cmdqu_uart1_dt_max)
+						g_cmdqu_uart1_dt_max = dt;
+				}
+				dt_prev_tick = tick_now;
+
+				/* 握手成功后先配一次闭环参数（ppr=4680、20 kHz），
+				 * 与本周期后续的控制帧错开，避免底盘板来不及处理。 */
+				if (g_cmdqu_uart1_ack != 0U && ctrl_cfg_sent == 0U) {
+					unsigned char cfg[4] = {0x12U, 0x48U, 0x4EU, 0x20U};
+
+					cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_CONFIG, cfg, 4U);
+					ctrl_cfg_sent = 1U;
+					sent_this_cycle = 1U;
+				}
+
+				if (!sent_this_cycle) {
+					if (!g_cmdqu_uart1_target_set) {
+						/* 还没收到目标：不发控制帧，等大核下发 */
+					} else if (wd_tripped) {
+						/* 已因心跳超时停车：保持静默，等新的目标把它清掉 */
+					} else if (now_ms > wd_deadline_ms) {
+						/* ★ 安全兜底：大核 500 ms 没刷新目标就立即停车。
+						 * 这正是"OS/应用失效后车不会一直跑"的那条保证。 */
+						unsigned char id;
+
+						id = 0U;
+						cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP, &id, 1U);
+						id = 1U;
+						cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP, &id, 1U);
+						g_cmdqu_uart1_target_lr = 0U;
+						g_cmdqu_uart1_wd_stops++;
+						wd_tripped = 1U;
+					} else {
+						unsigned char sp[3];
+						int left = (short)(g_cmdqu_uart1_target_lr & 0xFFFFU);
+						int right = (short)(g_cmdqu_uart1_target_lr >> 16);
+
+						sp[0] = 0U;
+						sp[1] = (unsigned char)((left >> 8) & 0xFF);
+						sp[2] = (unsigned char)(left & 0xFF);
+						cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_SET_SPEED, sp, 3U);
+						sp[0] = 1U;
+						sp[1] = (unsigned char)((right >> 8) & 0xFF);
+						sp[2] = (unsigned char)(right & 0xFF);
+						cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_SET_SPEED, sp, 3U);
+					}
+				}
+				g_cmdqu_uart1_ctrl_count++;
+
+				/* 每 N 个控制周期读一次底盘状态与转速（RSP_STATUS = 5 字节） */
+				if ((g_cmdqu_uart1_ctrl_count % CMDQU_UART1_STATUS_EVERY) == 0U)
+					cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_GET_STATUS, NULL, 0U);
+
+				if (g_cmdqu_uart1_reply_cmd == CMDQU_MOTOR_RSP_STATUS &&
+				    g_cmdqu_uart1_reply_len >= 5U) {
+					unsigned char b0 = g_cmdqu_uart1_reply_payload[0];
+					unsigned char b1 = g_cmdqu_uart1_reply_payload[1];
+					unsigned char b2 = g_cmdqu_uart1_reply_payload[2];
+					unsigned char b3 = g_cmdqu_uart1_reply_payload[3];
+					unsigned char b4 = g_cmdqu_uart1_reply_payload[4];
+
+					g_cmdqu_uart1_ch_state = b0;
+					g_cmdqu_uart1_rpm_l = (int)(short)(((unsigned int)b1 << 8) | b2);
+					g_cmdqu_uart1_rpm_r = (int)(short)(((unsigned int)b3 << 8) | b4);
+				}
+			}
 		}
 	}
 }
@@ -1070,6 +1272,26 @@ void prvCmdquReportTask(void *pvParameters)
 				cmdqu_shm_publish(hdr, CMDQU_MSG_UART_PROBE,
 						  (const unsigned char *)&probe,
 						  sizeof(probe));
+			}
+			if (g_cmdqu_uart1_mode >= 3U) {
+				struct cmdqu_uart_ctrl ctrl;
+
+				ctrl.seq = ++g_cmdqu_uart1_ctrl_seq;
+				ctrl.mode = g_cmdqu_uart1_mode;
+				ctrl.period_ms = g_cmdqu_uart1_ctrl_period_ms;
+				ctrl.target_lr = g_cmdqu_uart1_target_lr;
+				ctrl.ctrl_count = g_cmdqu_uart1_ctrl_count;
+				ctrl.ack_total = g_cmdqu_uart1_ack;
+				ctrl.wd_stops = g_cmdqu_uart1_wd_stops;
+				ctrl.dt_max_ticks = g_cmdqu_uart1_dt_max;
+				ctrl.ch_state = g_cmdqu_uart1_ch_state;
+				ctrl.rpm_l = g_cmdqu_uart1_rpm_l;
+				ctrl.rpm_r = g_cmdqu_uart1_rpm_r;
+				ctrl.reserved = 0U;
+				cmdqu_shm_publish(hdr, CMDQU_MSG_UART_CTRL,
+						  (const unsigned char *)&ctrl, sizeof(ctrl));
+				/* 每秒清空一次"本秒最大周期"，下一窗口重新统计 */
+				g_cmdqu_uart1_dt_max = 0U;
 			}
 			last_uart_pub_ms = now_ms;
 		}
