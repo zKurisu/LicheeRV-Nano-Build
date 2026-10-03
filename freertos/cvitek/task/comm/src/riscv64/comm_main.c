@@ -1228,16 +1228,23 @@ void prvCmdquUart1Task(void *pvParameters)
 					} else if (g_cmdqu_uart1_wd_tripped) {
 						/* 已因心跳超时停车：保持静默，等新的目标把它清掉 */
 					} else if (now_ms > g_cmdqu_uart1_wd_deadline_ms) {
-						/* ★ 安全兜底：大核 500 ms 没刷新目标就立即停车。
-						 * 这正是"OS/应用失效后车不会一直跑"的那条保证。 */
-						unsigned char id;
+						/* ★ 安全兜底：大核超过看门狗窗口没刷新目标就立即停车。
+						 * 这正是"OS/应用失效后车不会一直跑"的那条保证。
+						 *
+						 * 只有"目标非 0"时才算一次真正的兜底停车：每段 --secs
+						 * 会话结束时目标本来就已归零，那时再发 STOP 并计数只会把
+						 * wd_stops 弄脏（实测每轮都会 +1），使它不能当作"车确实
+						 * 是被看门狗兜住的"这类证据。 */
+						if (g_cmdqu_uart1_target_lr != 0U) {
+							unsigned char id;
 
-						id = 0U;
-						cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP, &id, 1U);
-						id = 1U;
-						cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP, &id, 1U);
-						g_cmdqu_uart1_target_lr = 0U;
-						g_cmdqu_uart1_wd_stops++;
+							id = 0U;
+							cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP, &id, 1U);
+							id = 1U;
+							cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP, &id, 1U);
+							g_cmdqu_uart1_target_lr = 0U;
+							g_cmdqu_uart1_wd_stops++;
+						}
 						g_cmdqu_uart1_wd_tripped = 1U;
 					} else {
 						unsigned char sp[3];
