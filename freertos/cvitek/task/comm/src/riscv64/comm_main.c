@@ -212,6 +212,8 @@ static volatile unsigned int g_cmdqu_uart1_wd_stops = 0U;
 static volatile unsigned long long g_cmdqu_uart1_wd_deadline_ms = 0ULL;
 static volatile unsigned int g_cmdqu_uart1_wd_tripped = 0U;
 static volatile unsigned int g_cmdqu_uart1_wd_ms = CMDQU_UART1_WD_MS;
+/* 周期控制开始前需要补一次握手：进入 mode=3 时置位；底盘自报 UNINIT 时也置位 */
+static volatile unsigned int g_cmdqu_uart1_ctrl_need_hs = 0U;
 static volatile unsigned int g_cmdqu_uart1_dt_max = 0U;    /* 本秒内控制周期最大值（tick） */
 /* 控制周期分布（累计，直到关闭链路）：用来给出抖动分布而不是只看某一秒的最大值 */
 static volatile unsigned int g_cmdqu_uart1_hist_seq = 0U;
@@ -589,8 +591,13 @@ void prvCmdQuRunTask(void *pvParameters)
 						(1000U / configTICK_RATE_HZ) +
 					g_cmdqu_uart1_wd_ms;
 				g_cmdqu_uart1_wd_tripped = 0U;
-				if (g_cmdqu_uart1_mode < 3U)
+				if (g_cmdqu_uart1_mode < 3U) {
 					g_cmdqu_uart1_mode = 3U;
+					/* 每次"开始一段周期控制"都重新握手：底盘可能被别的工具
+					 * RESET 过、或自己复位过，处在 UNINIT 的底盘会静默
+					 * 忽略 SET_SPEED（实板踩到过）。 */
+					g_cmdqu_uart1_ctrl_need_hs = 1U;
+				}
 				rtos_cmdq.param_ptr = g_cmdqu_uart1_target_lr;
 				goto send_label;
 			case CMDQU_CMD_SET_CTRL_PERIOD:
@@ -1007,6 +1014,7 @@ void prvCmdquUart1Task(void *pvParameters)
 	unsigned int ctrl_div = 0U;       /* 基础节拍累加器，凑够一个控制周期 */
 	unsigned int dt_prev_tick = 0U;   /* 上一次控制帧所在 tick，用来量实测周期 */
 	unsigned int ctrl_cfg_sent = 0U;  /* 周期控制模式下是否已经发过 CMD_CONFIG */
+	unsigned long long hs_sent_ms = 0ULL; /* 最近一次补发 CMD_INIT 的时刻，用于节流 */
 	TickType_t last_wake = xTaskGetTickCount();
 
 	(void)pvParameters;
@@ -1174,9 +1182,26 @@ void prvCmdquUart1Task(void *pvParameters)
 				}
 				dt_prev_tick = tick_now;
 
-				/* 握手成功后先配一次闭环参数（ppr=4680、20 kHz），
-				 * 与本周期后续的控制帧错开，避免底盘板来不及处理。 */
-				if (g_cmdqu_uart1_ack != 0U && ctrl_cfg_sent == 0U) {
+				/* 底盘自报"未初始化"就补一次握手。底盘可能被别的工具 RESET 过，
+				 * 也可能自己复位过；UNINIT 的底盘会静默忽略 SET_SPEED（实板踩到过）。
+				 * 加 200 ms 节流：状态回包每 5 个控制周期才刷新一次，不节流的话
+				 * 会在新状态到达前反复重发 INIT。 */
+				if (g_cmdqu_uart1_ch_state == 0U && (now_ms - hs_sent_ms) >= 200ULL)
+					g_cmdqu_uart1_ctrl_need_hs = 1U;
+
+				/* 补握手：INIT（底盘回 IDLE）→ CONFIG（回 READY），之后才发速度；
+				 * 每拍只做一步，避免底盘板来不及处理。**UNINIT 状态下的底盘会静默
+				 * 忽略 SET_SPEED**，这一步不能省。INIT 会清掉底盘配置，所以它同时把
+				 * ctrl_cfg_sent 归零，由下一拍补 CONFIG——补握手不能只在"首次配置
+				 * 之前"这一种情形下生效（原先它就写在 ctrl_cfg_sent == 0 的分支里，
+				 * 一段控制会话里只可能生效一次）。 */
+				if (g_cmdqu_uart1_ctrl_need_hs) {
+					cmdqu_uart1_send_init();
+					g_cmdqu_uart1_ctrl_need_hs = 0U;
+					hs_sent_ms = now_ms;
+					ctrl_cfg_sent = 0U;
+					sent_this_cycle = 1U;
+				} else if (ctrl_cfg_sent == 0U) {
 					unsigned char cfg[4] = {0x12U, 0x48U, 0x4EU, 0x20U};
 
 					cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_CONFIG, cfg, 4U);
