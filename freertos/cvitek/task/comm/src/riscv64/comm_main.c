@@ -63,6 +63,8 @@
 #define CMDQU_MSG_UART_PROBE     7U
 /* 环消息类型：UART1 周期控制状态（mode>=3 时每秒上报） */
 #define CMDQU_MSG_UART_CTRL      8U
+/* 环消息类型：UART1 控制周期分布（mode>=3 时每秒上报，累计值） */
+#define CMDQU_MSG_UART_CTRL_HIST 9U
 
 /****************************************************************************
  * 小核侧 UART1：直接与底盘控制板对话（焊盘 A18/A19）
@@ -112,6 +114,24 @@ struct cmdqu_uart_ctrl {
 	int rpm_l;                  /* 底盘板回包的左轮转速 */
 	int rpm_r;                  /* 底盘板回包的右轮转速 */
 	unsigned int reserved;
+};
+
+/* UART1 控制周期分布，作为 kind=9 的环消息载荷（mode>=3 时每秒上报累计值）。
+ * 控制周期按 5 ms 基础节拍量化，所以"抖动"体现在 dt 与期望 tick 数之差上：
+ * 正常应当全部落在 `hist_eq`。 */
+struct cmdqu_uart_ctrl_hist {
+	unsigned int seq;
+	unsigned int period_ticks; /* 期望周期（tick） */
+	unsigned int count;        /* 累计统计的周期数 */
+	unsigned int min_ticks;
+	unsigned int max_ticks;
+	unsigned int sum_ticks;    /* 用于算均值 */
+	unsigned int hist_lt;      /* dt < 期望（不该出现） */
+	unsigned int hist_eq;      /* dt == 期望（正常） */
+	unsigned int hist_p1;      /* 期望 +1 tick */
+	unsigned int hist_p2;      /* 期望 +2 tick */
+	unsigned int hist_ge;      /* ≥ 期望 +3 tick（严重超时） */
+	unsigned int wd_stops;
 };
 #define CMDQU_UART1_RBR_THR      0x00U
 #define CMDQU_UART1_IER_DLM      0x04U
@@ -190,6 +210,16 @@ static volatile unsigned int g_cmdqu_uart1_wd_stops = 0U;
 static volatile unsigned long long g_cmdqu_uart1_wd_deadline_ms = 0ULL;
 static volatile unsigned int g_cmdqu_uart1_wd_tripped = 0U;
 static volatile unsigned int g_cmdqu_uart1_dt_max = 0U;    /* 本秒内控制周期最大值（tick） */
+/* 控制周期分布（累计，直到关闭链路）：用来给出抖动分布而不是只看某一秒的最大值 */
+static volatile unsigned int g_cmdqu_uart1_hist_seq = 0U;
+static volatile unsigned int g_cmdqu_uart1_dt_min = 0xFFFFFFFFU;
+static volatile unsigned int g_cmdqu_uart1_dt_sum = 0U;
+static volatile unsigned int g_cmdqu_uart1_dt_count = 0U;
+static volatile unsigned int g_cmdqu_uart1_hist_lt = 0U;
+static volatile unsigned int g_cmdqu_uart1_hist_eq = 0U;
+static volatile unsigned int g_cmdqu_uart1_hist_p1 = 0U;
+static volatile unsigned int g_cmdqu_uart1_hist_p2 = 0U;
+static volatile unsigned int g_cmdqu_uart1_hist_ge = 0U;
 static volatile unsigned int g_cmdqu_uart1_ch_state = 0xFFU; /* 底盘回包里的状态机 */
 static volatile int g_cmdqu_uart1_rpm_l = 0;
 static volatile int g_cmdqu_uart1_rpm_r = 0;
@@ -970,6 +1000,14 @@ void prvCmdquUart1Task(void *pvParameters)
 				g_cmdqu_uart1_ctrl_count = 0U;
 				g_cmdqu_uart1_wd_stops = 0U;
 				g_cmdqu_uart1_dt_max = 0U;
+				g_cmdqu_uart1_dt_min = 0xFFFFFFFFU;
+				g_cmdqu_uart1_dt_sum = 0U;
+				g_cmdqu_uart1_dt_count = 0U;
+				g_cmdqu_uart1_hist_lt = 0U;
+				g_cmdqu_uart1_hist_eq = 0U;
+				g_cmdqu_uart1_hist_p1 = 0U;
+				g_cmdqu_uart1_hist_p2 = 0U;
+				g_cmdqu_uart1_hist_ge = 0U;
 				g_cmdqu_uart1_ch_state = 0xFFU;
 				g_cmdqu_uart1_rpm_l = 0;
 				g_cmdqu_uart1_rpm_r = 0;
@@ -1075,6 +1113,20 @@ void prvCmdquUart1Task(void *pvParameters)
 
 					if (dt > g_cmdqu_uart1_dt_max)
 						g_cmdqu_uart1_dt_max = dt;
+					if (dt < g_cmdqu_uart1_dt_min)
+						g_cmdqu_uart1_dt_min = dt;
+					g_cmdqu_uart1_dt_sum += dt;
+					g_cmdqu_uart1_dt_count++;
+					if (dt < div)
+						g_cmdqu_uart1_hist_lt++;
+					else if (dt == div)
+						g_cmdqu_uart1_hist_eq++;
+					else if (dt == div + 1U)
+						g_cmdqu_uart1_hist_p1++;
+					else if (dt == div + 2U)
+						g_cmdqu_uart1_hist_p2++;
+					else
+						g_cmdqu_uart1_hist_ge++;
 				}
 				dt_prev_tick = tick_now;
 
@@ -1310,8 +1362,32 @@ void prvCmdquReportTask(void *pvParameters)
 				ctrl.reserved = 0U;
 				cmdqu_shm_publish(hdr, CMDQU_MSG_UART_CTRL,
 						  (const unsigned char *)&ctrl, sizeof(ctrl));
-				/* 每秒清空一次"本秒最大周期"，下一窗口重新统计 */
-				g_cmdqu_uart1_dt_max = 0U;
+
+				{
+					struct cmdqu_uart_ctrl_hist hist;
+					unsigned int div = g_cmdqu_uart1_ctrl_period_ms /
+							   CMDQU_UART1_TICK_MS;
+
+					if (div == 0U)
+						div = 1U;
+					hist.seq = ++g_cmdqu_uart1_hist_seq;
+					hist.period_ticks = div;
+					hist.count = g_cmdqu_uart1_dt_count;
+					hist.min_ticks = (g_cmdqu_uart1_dt_count != 0U)
+								 ? g_cmdqu_uart1_dt_min
+								 : 0U;
+					hist.max_ticks = g_cmdqu_uart1_dt_max;
+					hist.sum_ticks = g_cmdqu_uart1_dt_sum;
+					hist.hist_lt = g_cmdqu_uart1_hist_lt;
+					hist.hist_eq = g_cmdqu_uart1_hist_eq;
+					hist.hist_p1 = g_cmdqu_uart1_hist_p1;
+					hist.hist_p2 = g_cmdqu_uart1_hist_p2;
+					hist.hist_ge = g_cmdqu_uart1_hist_ge;
+					hist.wd_stops = g_cmdqu_uart1_wd_stops;
+					cmdqu_shm_publish(hdr, CMDQU_MSG_UART_CTRL_HIST,
+							  (const unsigned char *)&hist,
+							  sizeof(hist));
+				}
 			}
 			last_uart_pub_ms = now_ms;
 		}
