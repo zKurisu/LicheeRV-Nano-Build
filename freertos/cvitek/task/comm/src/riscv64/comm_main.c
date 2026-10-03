@@ -181,6 +181,12 @@ static volatile unsigned int g_cmdqu_uart1_target_lr = 0U; /* 低 16 = 左 i16�
 static volatile unsigned int g_cmdqu_uart1_target_set = 0U;
 static volatile unsigned int g_cmdqu_uart1_ctrl_count = 0U;
 static volatile unsigned int g_cmdqu_uart1_wd_stops = 0U;
+/* 心跳看门狗的共享状态：由 0x62 命令刷新截止时刻并清除"已停车"标志，
+ * 由 UART1 任务在控制周期里检查。**不能放在任务局部**——之前就是因为
+ * 截止时刻是任务局部且从未赋值（恒为 0），看门狗在第一个周期就误触发，
+ * 小核此后一个 SET_SPEED 都不发（实板现象：底盘"运行中"但 RPM=0）。 */
+static volatile unsigned long long g_cmdqu_uart1_wd_deadline_ms = 0ULL;
+static volatile unsigned int g_cmdqu_uart1_wd_tripped = 0U;
 static volatile unsigned int g_cmdqu_uart1_dt_max = 0U;    /* 本秒内控制周期最大值（tick） */
 static volatile unsigned int g_cmdqu_uart1_ch_state = 0xFFU; /* 底盘回包里的状态机 */
 static volatile int g_cmdqu_uart1_rpm_l = 0;
@@ -510,7 +516,13 @@ void prvCmdQuRunTask(void *pvParameters)
 						(((unsigned int)(unsigned short)r) << 16);
 				}
 				g_cmdqu_uart1_target_set = 1U;
-				g_cmdqu_uart1_wd_stops = 0U;
+				/* 刷新心跳截止时刻，并清掉"已因超时停车"的标志——
+				 * 新目标一到就恢复下发，这正是心跳语义。 */
+				g_cmdqu_uart1_wd_deadline_ms =
+					(unsigned long long)xTaskGetTickCount() *
+						(1000U / configTICK_RATE_HZ) +
+					CMDQU_UART1_WD_MS;
+				g_cmdqu_uart1_wd_tripped = 0U;
 				if (g_cmdqu_uart1_mode < 3U)
 					g_cmdqu_uart1_mode = 3U;
 				rtos_cmdq.param_ptr = g_cmdqu_uart1_target_lr;
@@ -916,8 +928,6 @@ void prvCmdquUart1Task(void *pvParameters)
 	unsigned int ctrl_div = 0U;       /* 基础节拍累加器，凑够一个控制周期 */
 	unsigned int dt_prev_tick = 0U;   /* 上一次控制帧所在 tick，用来量实测周期 */
 	unsigned int ctrl_cfg_sent = 0U;  /* 周期控制模式下是否已经发过 CMD_CONFIG */
-	unsigned long long wd_deadline_ms = 0ULL;
-	unsigned int wd_tripped = 0U;
 	TickType_t last_wake = xTaskGetTickCount();
 
 	(void)pvParameters;
@@ -959,7 +969,6 @@ void prvCmdquUart1Task(void *pvParameters)
 				g_cmdqu_uart1_rpm_r = 0;
 				ctrl_div = 0U;
 				dt_prev_tick = 0U;
-				wd_tripped = 0U;
 				ctrl_cfg_sent = 0U;
 			}
 			continue;
@@ -1076,9 +1085,9 @@ void prvCmdquUart1Task(void *pvParameters)
 				if (!sent_this_cycle) {
 					if (!g_cmdqu_uart1_target_set) {
 						/* 还没收到目标：不发控制帧，等大核下发 */
-					} else if (wd_tripped) {
+					} else if (g_cmdqu_uart1_wd_tripped) {
 						/* 已因心跳超时停车：保持静默，等新的目标把它清掉 */
-					} else if (now_ms > wd_deadline_ms) {
+					} else if (now_ms > g_cmdqu_uart1_wd_deadline_ms) {
 						/* ★ 安全兜底：大核 500 ms 没刷新目标就立即停车。
 						 * 这正是"OS/应用失效后车不会一直跑"的那条保证。 */
 						unsigned char id;
@@ -1089,7 +1098,7 @@ void prvCmdquUart1Task(void *pvParameters)
 						cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP, &id, 1U);
 						g_cmdqu_uart1_target_lr = 0U;
 						g_cmdqu_uart1_wd_stops++;
-						wd_tripped = 1U;
+						g_cmdqu_uart1_wd_tripped = 1U;
 					} else {
 						unsigned char sp[3];
 						int left = (short)(g_cmdqu_uart1_target_lr & 0xFFFFU);
