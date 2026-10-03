@@ -114,7 +114,7 @@ struct cmdqu_uart_probe {
 	unsigned int mode;
 	unsigned int stage;       /* 已发出的自检步数：0..CMDQU_UART1_PROBE_STEPS */
 	unsigned int err;         /* 超时、回显命令号失配等异常次数 */
-	unsigned int init_ack;    /* CMD_INIT 得到的 ACK 数 */
+	unsigned int ack_total;   /* ACK 总数（含 INIT 与自检各命令；分类计数见下面三项） */
 	unsigned int cfg_ack;     /* CMD_CONFIG 的 ACK 数 */
 	unsigned int speed_ack;   /* CMD_SET_SPEED 的 ACK 数 */
 	unsigned int stop_ack;    /* CMD_STOP 的 ACK 数 */
@@ -1059,7 +1059,7 @@ void prvCmdquReportTask(void *pvParameters)
 				probe.mode = g_cmdqu_uart1_mode;
 				probe.stage = g_cmdqu_uart1_probe_stage;
 				probe.err = g_cmdqu_uart1_probe_err;
-				probe.init_ack = g_cmdqu_uart1_ack;
+				probe.ack_total = g_cmdqu_uart1_ack;
 				probe.cfg_ack = g_cmdqu_uart1_cfg_ack;
 				probe.speed_ack = g_cmdqu_uart1_speed_ack;
 				probe.stop_ack = g_cmdqu_uart1_stop_ack;
