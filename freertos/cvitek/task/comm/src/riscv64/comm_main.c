@@ -134,6 +134,7 @@ struct cmdqu_uart_link {
 	unsigned int nack_rx;           /* 收到多少帧 NACK(0x81) */
 	unsigned int rx_bytes;          /* 该链路累计收到的字节数 */
 	unsigned int frame_err;         /* 校验失败 / 认不出的帧数 */
+	unsigned int rsp_other;         /* 合法但不是 ACK/NACK 的回包（状态/转速查询结果） */
 	unsigned long long last_ack_us; /* 最近一次 ACK 的小核时刻（微秒） */
 };
 
@@ -161,6 +162,7 @@ static volatile unsigned int g_cmdqu_uart1_ack = 0U;
 static volatile unsigned int g_cmdqu_uart1_nack = 0U;
 static volatile unsigned int g_cmdqu_uart1_rx_bytes = 0U;
 static volatile unsigned int g_cmdqu_uart1_errs = 0U;
+static volatile unsigned int g_cmdqu_uart1_rsp_other = 0U; /* 合法但不是 ACK/NACK 的回包 */
 static volatile unsigned long long g_cmdqu_uart1_last_ack_us = 0ULL;
 static volatile unsigned int g_cmdqu_uart1_link_seq = 0U;
 /* 命令自检（mode>=2）：状态机、每类命令的 ACK 计数、最近一次收发命令号 */
@@ -881,10 +883,13 @@ static unsigned int cmdqu_uart1_parse(unsigned char *buf, unsigned int *n,
 			g_cmdqu_uart1_nack++;
 			g_cmdqu_uart1_replies++;
 		} else {
-			g_cmdqu_uart1_errs++; /* 合法帧但命令号不认识 */
+			/* 校验通过但不是 ACK/NACK：例如 RSP_STATUS(0x91)、RSP_RPM_DATA(0x90)。
+			 * 这些是**正常回包**，早前误计进"帧错误"，导致读数看起来像链路很脏
+			 * （实板上"帧错误"数恰好等于 GET_STATUS 的次数，才暴露了这个标签错误）。 */
+			g_cmdqu_uart1_rsp_other++;
 		}
 	} else {
-		g_cmdqu_uart1_errs++;
+		g_cmdqu_uart1_errs++; /* 只有校验失败才计入真正的帧错误 */
 	}
 
 	consumed = 5U + len;
@@ -948,6 +953,7 @@ void prvCmdquUart1Task(void *pvParameters)
 				g_cmdqu_uart1_nack = 0U;
 				g_cmdqu_uart1_rx_bytes = 0U;
 				g_cmdqu_uart1_errs = 0U;
+				g_cmdqu_uart1_rsp_other = 0U;
 				g_cmdqu_uart1_last_ack_us = 0ULL;
 				g_cmdqu_uart1_probe_stage = 0U;
 				g_cmdqu_uart1_probe_err = 0U;
@@ -1262,6 +1268,7 @@ void prvCmdquReportTask(void *pvParameters)
 			link.nack_rx = g_cmdqu_uart1_nack;
 			link.rx_bytes = g_cmdqu_uart1_rx_bytes;
 			link.frame_err = g_cmdqu_uart1_errs;
+			link.rsp_other = g_cmdqu_uart1_rsp_other;
 			link.last_ack_us = g_cmdqu_uart1_last_ack_us;
 			cmdqu_shm_publish(hdr, CMDQU_MSG_UART_LINK,
 					  (const unsigned char *)&link, sizeof(link));
