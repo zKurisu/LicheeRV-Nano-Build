@@ -53,6 +53,8 @@
 /* M3 第 3 步：周期控制。0x62 设目标速度（并以心跳维持），0x63 设控制周期 */
 #define CMDQU_CMD_SET_TARGET      0x62U
 #define CMDQU_CMD_SET_CTRL_PERIOD 0x63U
+/* 0x64：设置心跳看门狗窗口（毫秒）。默认 500 ms；调大用于"看得见"的演示。 */
+#define CMDQU_CMD_SET_WD         0x64U
 /* 最小上报周期：本固件 tick 为 200 Hz（5 ms），更小的值会被 pdMS_TO_TICKS 算成 0 */
 #define CMDQU_MIN_PERIOD_MS      5U
 /* 环消息类型：状态快照 */
@@ -113,7 +115,7 @@ struct cmdqu_uart_ctrl {
 	unsigned int ch_state;      /* 底盘板回包里的状态机：0 未初始化/1 空闲/2 就绪/3 运行/4 错误 */
 	int rpm_l;                  /* 底盘板回包的左轮转速 */
 	int rpm_r;                  /* 底盘板回包的右轮转速 */
-	unsigned int reserved;
+	unsigned int wd_ms;         /* 当前心跳看门狗窗口（毫秒），由 0x64 命令设置 */
 };
 
 /* UART1 控制周期分布，作为 kind=9 的环消息载荷（mode>=3 时每秒上报累计值）。
@@ -209,6 +211,7 @@ static volatile unsigned int g_cmdqu_uart1_wd_stops = 0U;
  * 小核此后一个 SET_SPEED 都不发（实板现象：底盘"运行中"但 RPM=0）。 */
 static volatile unsigned long long g_cmdqu_uart1_wd_deadline_ms = 0ULL;
 static volatile unsigned int g_cmdqu_uart1_wd_tripped = 0U;
+static volatile unsigned int g_cmdqu_uart1_wd_ms = CMDQU_UART1_WD_MS;
 static volatile unsigned int g_cmdqu_uart1_dt_max = 0U;    /* 本秒内控制周期最大值（tick） */
 /* 控制周期分布（累计，直到关闭链路）：用来给出抖动分布而不是只看某一秒的最大值 */
 static volatile unsigned int g_cmdqu_uart1_hist_seq = 0U;
@@ -584,7 +587,7 @@ void prvCmdQuRunTask(void *pvParameters)
 				g_cmdqu_uart1_wd_deadline_ms =
 					(unsigned long long)xTaskGetTickCount() *
 						(1000U / configTICK_RATE_HZ) +
-					CMDQU_UART1_WD_MS;
+					g_cmdqu_uart1_wd_ms;
 				g_cmdqu_uart1_wd_tripped = 0U;
 				if (g_cmdqu_uart1_mode < 3U)
 					g_cmdqu_uart1_mode = 3U;
@@ -598,6 +601,16 @@ void prvCmdQuRunTask(void *pvParameters)
 				if (g_cmdqu_uart1_ctrl_period_ms > 1000U)
 					g_cmdqu_uart1_ctrl_period_ms = 1000U;
 				rtos_cmdq.param_ptr = g_cmdqu_uart1_ctrl_period_ms;
+				goto send_label;
+			case CMDQU_CMD_SET_WD:
+				/* 心跳看门狗窗口（毫秒）：默认 500，演示时可以调大到几秒，
+				 * 这样"停喂心跳 → 自动停车"能肉眼看清。范围 100~10000 ms。 */
+				g_cmdqu_uart1_wd_ms = rtos_cmdq.param_ptr;
+				if (g_cmdqu_uart1_wd_ms < 100U)
+					g_cmdqu_uart1_wd_ms = 100U;
+				if (g_cmdqu_uart1_wd_ms > 10000U)
+					g_cmdqu_uart1_wd_ms = 10000U;
+				rtos_cmdq.param_ptr = g_cmdqu_uart1_wd_ms;
 				goto send_label;
 			case SYS_CMD_INFO_LINUX:
 			default:
@@ -1390,7 +1403,7 @@ void prvCmdquReportTask(void *pvParameters)
 				ctrl.ch_state = g_cmdqu_uart1_ch_state;
 				ctrl.rpm_l = g_cmdqu_uart1_rpm_l;
 				ctrl.rpm_r = g_cmdqu_uart1_rpm_r;
-				ctrl.reserved = 0U;
+				ctrl.wd_ms = g_cmdqu_uart1_wd_ms;
 				cmdqu_shm_publish(hdr, CMDQU_MSG_UART_CTRL,
 						  (const unsigned char *)&ctrl, sizeof(ctrl));
 
