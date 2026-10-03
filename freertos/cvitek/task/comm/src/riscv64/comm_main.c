@@ -56,6 +56,8 @@
 #define CMDQU_MSG_STATE_SNAPSHOT 1U
 /* 环消息类型：UART1（底盘链路）握手状态，见 prvCmdquUart1Task 的说明 */
 #define CMDQU_MSG_UART_LINK      6U
+/* 环消息类型：UART1 命令自检（mode>=2 时每秒上报） */
+#define CMDQU_MSG_UART_PROBE     7U
 
 /****************************************************************************
  * 小核侧 UART1：直接与底盘控制板对话（焊盘 A18/A19）
@@ -71,6 +73,16 @@
  * 干扰，所以必须由大核显式用 CMDQU_CMD_UART1_MODE(0x61) 打开。
  ****************************************************************************/
 #define CMDQU_UART1_BASE         0x04150000UL
+/* 底盘协议命令号（与 AKA-00 的 motor.rs / test_uart.py 一致） */
+#define CMDQU_MOTOR_CMD_INIT     0x01U
+#define CMDQU_MOTOR_CMD_CONFIG   0x02U
+#define CMDQU_MOTOR_CMD_SET_SPEED 0x10U
+#define CMDQU_MOTOR_CMD_STOP     0x11U
+#define CMDQU_MOTOR_RSP_ACK      0x80U
+#define CMDQU_MOTOR_RSP_NACK     0x81U
+/* 自检步骤数：CONFIG / SET_SPEED(0,0) / SET_SPEED(1,0) / STOP(0) / STOP(1) */
+#define CMDQU_UART1_PROBE_STEPS  5U
+#define CMDQU_UART1_PROBE_GAP_MS 300U
 #define CMDQU_UART1_RBR_THR      0x00U
 #define CMDQU_UART1_IER_DLM      0x04U
 #define CMDQU_UART1_FCR_IIR      0x08U
@@ -95,6 +107,23 @@ struct cmdqu_uart_link {
 	unsigned long long last_ack_us; /* 最近一次 ACK 的小核时刻（微秒） */
 };
 
+/* UART1 命令自检状态，作为 kind=7 的环消息载荷（mode>=2 时每秒一条）。
+ * 与 kind=6 分开是为了不动它的既有布局：kind=6 只有握手统计，这里是命令级细节。 */
+struct cmdqu_uart_probe {
+	unsigned int seq;
+	unsigned int mode;
+	unsigned int stage;       /* 已发出的自检步数：0..CMDQU_UART1_PROBE_STEPS */
+	unsigned int err;         /* 超时、回显命令号失配等异常次数 */
+	unsigned int init_ack;    /* CMD_INIT 得到的 ACK 数 */
+	unsigned int cfg_ack;     /* CMD_CONFIG 的 ACK 数 */
+	unsigned int speed_ack;   /* CMD_SET_SPEED 的 ACK 数 */
+	unsigned int stop_ack;    /* CMD_STOP 的 ACK 数 */
+	unsigned int last_sent;   /* 最后发出的命令号 */
+	unsigned int last_reply;  /* 最后收到的合法帧命令号（0x80/0x81） */
+	unsigned int last_echo;   /* 该帧回显的命令号 */
+	unsigned int reserved;
+};
+
 /* UART1 链路测试状态（由 mailbox 命令 0x61 开关） */
 static volatile unsigned int g_cmdqu_uart1_mode = 0U;
 static volatile unsigned int g_cmdqu_uart1_sent = 0U;
@@ -104,6 +133,17 @@ static volatile unsigned int g_cmdqu_uart1_rx_bytes = 0U;
 static volatile unsigned int g_cmdqu_uart1_errs = 0U;
 static volatile unsigned long long g_cmdqu_uart1_last_ack_us = 0ULL;
 static volatile unsigned int g_cmdqu_uart1_link_seq = 0U;
+/* 命令自检（mode>=2）：状态机、每类命令的 ACK 计数、最近一次收发命令号 */
+static volatile unsigned int g_cmdqu_uart1_probe_seq = 0U;
+static volatile unsigned int g_cmdqu_uart1_probe_stage = 0U; /* 已发出的自检步数 */
+static volatile unsigned int g_cmdqu_uart1_probe_err = 0U;   /* 超时/失配次数 */
+static volatile unsigned int g_cmdqu_uart1_cfg_ack = 0U;
+static volatile unsigned int g_cmdqu_uart1_speed_ack = 0U;
+static volatile unsigned int g_cmdqu_uart1_stop_ack = 0U;
+static volatile unsigned int g_cmdqu_uart1_last_sent = 0U;
+static volatile unsigned int g_cmdqu_uart1_last_reply = 0U; /* 合法帧的命令号 */
+static volatile unsigned int g_cmdqu_uart1_last_echo = 0U;  /* ACK/NACK 回显的命令号 */
+static volatile unsigned int g_cmdqu_uart1_replies = 0U;    /* 收到的 ACK+NACK 总数 */
 
 /* 上报周期（毫秒）与自增序号，仅本文件使用 */
 static volatile unsigned int g_cmdqu_report_period_ms = 1000U;
@@ -392,7 +432,10 @@ void prvCmdQuRunTask(void *pvParameters)
 				 *
 				 * 之所以要显式开关：厂商 Linux 上 AKA-00 应用正在使用
 				 * /dev/ttyS1，小核若同时往同一条链路发帧会互相干扰。 */
-				g_cmdqu_uart1_mode = rtos_cmdq.param_ptr ? 1U : 0U;
+				if (rtos_cmdq.param_ptr > 2U)
+					g_cmdqu_uart1_mode = 2U; /* 只定义 0/1/2，越界按最大档处理 */
+				else
+					g_cmdqu_uart1_mode = rtos_cmdq.param_ptr;
 				rtos_cmdq.param_ptr = g_cmdqu_uart1_mode;
 				goto send_label;
 			case SYS_CMD_INFO_LINUX:
@@ -632,15 +675,72 @@ static void cmdqu_uart1_putc(unsigned char c)
 	mmio_write_32(CMDQU_UART1_BASE + CMDQU_UART1_RBR_THR, (unsigned int)c);
 }
 
+/* 发一帧底盘协议报文：AA 55 cmd len payload… cksum（逐字节异或，含 cmd 与 len）。
+ * 载荷最长 4 字节就够（CONFIG 的 ppr+pwm_freq、SET_SPEED 的 id+两字节 PWM）。 */
+static void cmdqu_uart1_send_frame(unsigned char cmd, const unsigned char *payload,
+				   unsigned int len)
+{
+	unsigned char buf[9];
+	unsigned int i, acc;
+
+	if (len > sizeof(buf) - 5U)
+		return;
+	buf[0] = 0xAAU;
+	buf[1] = 0x55U;
+	buf[2] = cmd;
+	buf[3] = (unsigned char)len;
+	acc = (unsigned int)cmd ^ len;
+	for (i = 0U; i < len; i++) {
+		buf[4U + i] = payload[i];
+		acc ^= payload[i];
+	}
+	buf[4U + len] = (unsigned char)acc;
+	for (i = 0U; i < 5U + len; i++)
+		cmdqu_uart1_putc(buf[i]);
+	g_cmdqu_uart1_last_sent = cmd;
+}
+
 static void cmdqu_uart1_send_init(void)
 {
-	/* CMD_INIT = 0x01，载荷为空，校验和 = cmd ^ len = 0x01 */
-	static const unsigned char frame[5] = {0xAAU, 0x55U, 0x01U, 0x00U, 0x01U};
-	unsigned int i;
-
-	for (i = 0; i < sizeof(frame); i++)
-		cmdqu_uart1_putc(frame[i]);
+	cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_INIT, NULL, 0U);
 	g_cmdqu_uart1_sent++;
+}
+
+/* 命令自检的第 stage 步（0..CMDQU_UART1_PROBE_STEPS-1）。**全部是零速度/停车指令**：
+ * CONFIG 只改底盘板的闭环参数，SET_SPEED 给 0，STOP 就是停车。 */
+static void cmdqu_uart1_probe_step(unsigned int stage)
+{
+	unsigned char payload[4];
+
+	switch (stage) {
+	case 0U: /* CMD_CONFIG：ppr=4680（1:90 减速比）、pwm_freq=20000（与 AKA-00 一致） */
+		payload[0] = 0x12U;
+		payload[1] = 0x48U;
+		payload[2] = 0x4EU;
+		payload[3] = 0x20U;
+		cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_CONFIG, payload, 4U);
+		break;
+	case 1U: /* SET_SPEED(motor 0, 0) */
+		payload[0] = 0x00U;
+		payload[1] = 0x00U;
+		payload[2] = 0x00U;
+		cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_SET_SPEED, payload, 3U);
+		break;
+	case 2U: /* SET_SPEED(motor 1, 0) */
+		payload[0] = 0x01U;
+		payload[1] = 0x00U;
+		payload[2] = 0x00U;
+		cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_SET_SPEED, payload, 3U);
+		break;
+	case 3U: /* STOP(motor 0) */
+		payload[0] = 0x00U;
+		cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP, payload, 1U);
+		break;
+	default: /* STOP(motor 1) */
+		payload[0] = 0x01U;
+		cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP, payload, 1U);
+		break;
+	}
 }
 
 /* 在缓冲区开头尝试解析一帧；返回 1 表示消费了至少一个字节（调用方应继续循环） */
@@ -667,11 +767,15 @@ static unsigned int cmdqu_uart1_parse(unsigned char *buf, unsigned int *n,
 	for (i = 0U; i < len; i++)
 		acc ^= buf[4U + i];
 	if (acc == buf[4U + len]) {
-		if (buf[2] == 0x80U) { /* RSP_ACK */
+		g_cmdqu_uart1_last_reply = buf[2];
+		g_cmdqu_uart1_last_echo = (len >= 1U) ? buf[4] : 0U;
+		if (buf[2] == CMDQU_MOTOR_RSP_ACK) {
 			g_cmdqu_uart1_ack++;
 			g_cmdqu_uart1_last_ack_us = now_us;
-		} else if (buf[2] == 0x81U) { /* RSP_NACK */
+			g_cmdqu_uart1_replies++;
+		} else if (buf[2] == CMDQU_MOTOR_RSP_NACK) {
 			g_cmdqu_uart1_nack++;
+			g_cmdqu_uart1_replies++;
 		} else {
 			g_cmdqu_uart1_errs++; /* 合法帧但命令号不认识 */
 		}
@@ -714,6 +818,9 @@ void prvCmdquUart1Task(void *pvParameters)
 	unsigned int enabled = 0U;
 	unsigned long long last_send_ms = 0ULL;
 	unsigned long long now_ms;
+	unsigned int prev_replies = 0U;
+	unsigned long long probe_wait_ms = 0ULL;
+	unsigned int probe_answered = 0U;
 
 	(void)pvParameters;
 
@@ -732,6 +839,16 @@ void prvCmdquUart1Task(void *pvParameters)
 				g_cmdqu_uart1_rx_bytes = 0U;
 				g_cmdqu_uart1_errs = 0U;
 				g_cmdqu_uart1_last_ack_us = 0ULL;
+				g_cmdqu_uart1_probe_stage = 0U;
+				g_cmdqu_uart1_probe_err = 0U;
+				g_cmdqu_uart1_cfg_ack = 0U;
+				g_cmdqu_uart1_speed_ack = 0U;
+				g_cmdqu_uart1_stop_ack = 0U;
+				g_cmdqu_uart1_last_sent = 0U;
+				g_cmdqu_uart1_last_reply = 0U;
+				g_cmdqu_uart1_last_echo = 0U;
+				g_cmdqu_uart1_replies = 0U;
+				prev_replies = 0U;
 			}
 			continue;
 		}
@@ -739,6 +856,7 @@ void prvCmdquUart1Task(void *pvParameters)
 			cmdqu_uart1_hw_init();
 			enabled = 1U;
 			last_send_ms = now_ms - 60000ULL; /* 让下面立刻发第一帧 */
+			probe_wait_ms = now_ms;
 		}
 
 		/* 收：把 FIFO 抽干，交给解析器逐帧处理 */
@@ -759,6 +877,44 @@ void prvCmdquUart1Task(void *pvParameters)
 		}
 		while (cmdqu_uart1_parse(rx, &n, now_ms * 1000ULL))
 			;
+
+		/* 新回包：按"最后发出的命令号"归属，并推进自检状态机 */
+		if (g_cmdqu_uart1_replies != prev_replies) {
+			prev_replies = g_cmdqu_uart1_replies;
+			probe_wait_ms = now_ms;
+			probe_answered = 1U;
+			/* 底盘板的 ACK/NACK 会回显被确认的命令号，对不上就记一次错 */
+			if (g_cmdqu_uart1_last_echo != g_cmdqu_uart1_last_sent)
+				g_cmdqu_uart1_probe_err++;
+			switch (g_cmdqu_uart1_last_sent) {
+			case CMDQU_MOTOR_CMD_CONFIG:
+				g_cmdqu_uart1_cfg_ack++;
+				break;
+			case CMDQU_MOTOR_CMD_SET_SPEED:
+				g_cmdqu_uart1_speed_ack++;
+				break;
+			case CMDQU_MOTOR_CMD_STOP:
+				g_cmdqu_uart1_stop_ack++;
+				break;
+			default: /* INIT 已在 g_cmdqu_uart1_ack 里统计 */
+				break;
+			}
+		}
+
+		/* mode>=2：握手成功后按 300 ms 间隔跑一遍命令自检；
+		 * 某一步没等到回包就重发并记一次 err，避免卡死。 */
+		if (g_cmdqu_uart1_mode >= 2U && g_cmdqu_uart1_ack != 0U &&
+		    g_cmdqu_uart1_probe_stage < CMDQU_UART1_PROBE_STEPS) {
+			if (now_ms - probe_wait_ms >= CMDQU_UART1_PROBE_GAP_MS) {
+				/* 上一步没等到回包就记一次错，再继续下一步——不卡死 */
+				if (g_cmdqu_uart1_probe_stage > 0U && probe_answered == 0U)
+					g_cmdqu_uart1_probe_err++;
+				cmdqu_uart1_probe_step(g_cmdqu_uart1_probe_stage);
+				g_cmdqu_uart1_probe_stage++;
+				probe_wait_ms = now_ms;
+				probe_answered = 0U;
+			}
+		}
 
 		/* 发：未握手 500 ms 重试；已握手 5 s 保活 */
 		if (now_ms - last_send_ms >= (g_cmdqu_uart1_ack ? 5000ULL : 500ULL)) {
@@ -896,6 +1052,25 @@ void prvCmdquReportTask(void *pvParameters)
 			link.last_ack_us = g_cmdqu_uart1_last_ack_us;
 			cmdqu_shm_publish(hdr, CMDQU_MSG_UART_LINK,
 					  (const unsigned char *)&link, sizeof(link));
+			if (g_cmdqu_uart1_mode >= 2U) {
+				struct cmdqu_uart_probe probe;
+
+				probe.seq = ++g_cmdqu_uart1_probe_seq;
+				probe.mode = g_cmdqu_uart1_mode;
+				probe.stage = g_cmdqu_uart1_probe_stage;
+				probe.err = g_cmdqu_uart1_probe_err;
+				probe.init_ack = g_cmdqu_uart1_ack;
+				probe.cfg_ack = g_cmdqu_uart1_cfg_ack;
+				probe.speed_ack = g_cmdqu_uart1_speed_ack;
+				probe.stop_ack = g_cmdqu_uart1_stop_ack;
+				probe.last_sent = g_cmdqu_uart1_last_sent;
+				probe.last_reply = g_cmdqu_uart1_last_reply;
+				probe.last_echo = g_cmdqu_uart1_last_echo;
+				probe.reserved = 0U;
+				cmdqu_shm_publish(hdr, CMDQU_MSG_UART_PROBE,
+						  (const unsigned char *)&probe,
+						  sizeof(probe));
+			}
 			last_uart_pub_ms = now_ms;
 		}
 	}
