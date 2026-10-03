@@ -356,17 +356,48 @@ do { \
 
 DEFINE_CVI_SPINLOCK(mailbox_lock, SPIN_MBOX);
 
+/* 开机时清掉邮箱里"上一轮残留"的状态。
+ *
+ * **为什么必须做**：邮箱寄存器块在 AON 域，跨复位保留。上一轮若有一条命令写了槽位、
+ * 拉了门铃却没人取走（最典型的就是大核侧超时退出，例如 `uart 0` 超时），这个待处理位
+ * 会留到下一次开机；等小核在 `request_irq()` 内部 `plic_unmask_irq()` 的瞬间，PLIC
+ * 立刻把中断打上来，而此时队列还没建好，`prvQueueISR` 会拿着空的队列句柄进
+ * `xQueueSendFromISR` 而卡死。
+ *
+ * **实板现象（2026-10-03）**：小核 PC 停在 `request_irq` 收尾 / `do_irq` 入口之间来回
+ * 跳（不是正常到处跑），Ring B 一条快照都不发，槽位里躺着上一轮的命令且 `rtos_valid=0`，
+ * 大核这边所有命令都超时——正是这条路径。
+ */
+static void mailbox_clear_stale_state(void)
+{
+	struct mailbox_set_register *reg =
+		(struct mailbox_set_register *)MAILBOX_REG_BASE;
+	volatile unsigned long *ctx = (volatile unsigned long *)MAILBOX_REG_BUFF;
+	int i;
+
+	/* 清掉本核的待处理位与使能位，再把 8 个槽位清零 */
+	reg->cpu_mbox_set[RECEIVE_CPU].cpu_mbox_int_clr.mbox_int_clr = 0xFF;
+	reg->cpu_mbox_en[RECEIVE_CPU].mbox_info = 0;
+	for (i = 0; i < MAILBOX_MAX_NUM; i++) {
+		ctx[i * 2] = 0;
+		ctx[i * 2 + 1] = 0;
+	}
+}
+
 void main_cvirtos(void)
 {
 	printf("create cvi task\n");
+
+	/* 顺序很重要：队列必须先就绪，再使能中断——邮箱里若有残留待处理位，
+	 * request_irq() 里的 plic_unmask 会立刻触发 ISR，那时 ISR 要用队列句柄。 */
+	main_create_tasks();
+	mailbox_clear_stale_state();
 
 	request_irq(MBOX_INT_C906_2ND, prvQueueISR, 0, "mailbox", (void *)0);
 
 #ifdef FAST_IMAGE_ENABLE
 	start_camera(0);
 #endif
-
-	main_create_tasks();
 
 	/* 跨核状态上报任务：按大核设定的周期往共享环写状态快照。
 	 * 优先级取 tskIDLE_PRIORITY+4：高于 RGN/AUDIO（+3，都是周期/事件型任务），
