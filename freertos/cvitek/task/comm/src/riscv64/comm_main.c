@@ -1015,7 +1015,9 @@ void prvCmdquUart1Task(void *pvParameters)
 
 		/* mode>=2：握手成功后按 300 ms 间隔跑一遍命令自检；
 		 * 某一步没等到回包就重发并记一次 err，避免卡死。 */
-		if (g_cmdqu_uart1_mode >= 2U && g_cmdqu_uart1_ack != 0U &&
+		/* 只在本步专属的 mode=2 里跑：mode=3（周期控制）下若也跑自检，
+		 * 会往控制流里插 CONFIG/STOP，把底盘搅乱（实板已经踩到过）。 */
+		if (g_cmdqu_uart1_mode == 2U && g_cmdqu_uart1_ack != 0U &&
 		    g_cmdqu_uart1_probe_stage < CMDQU_UART1_PROBE_STEPS) {
 			if (now_ms - probe_wait_ms >= CMDQU_UART1_PROBE_GAP_MS) {
 				/* 上一步没等到回包就记一次错，再继续下一步——不卡死 */
@@ -1254,7 +1256,9 @@ void prvCmdquReportTask(void *pvParameters)
 			link.last_ack_us = g_cmdqu_uart1_last_ack_us;
 			cmdqu_shm_publish(hdr, CMDQU_MSG_UART_LINK,
 					  (const unsigned char *)&link, sizeof(link));
-			if (g_cmdqu_uart1_mode >= 2U) {
+			/* kind=7 是 mode=2（命令自检）的产物，别的档位不发，
+			 * 否则会看到一份"没跑过却显示已走完"的自检状态 */
+			if (g_cmdqu_uart1_mode == 2U) {
 				struct cmdqu_uart_probe probe;
 
 				probe.seq = ++g_cmdqu_uart1_probe_seq;
