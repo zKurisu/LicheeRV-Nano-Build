@@ -566,6 +566,9 @@ void prvCmdQuRunTask(void *pvParameters)
 				 *
 				 * 收到目标即进入 mode=3（周期控制），大核不必再单独发 0x61。 */
 				{
+					/* 改之前的目标：由 0 变成非 0 表示"要从静止开始一段运动"，
+					 * 那一拍要重新握手（原因见下面 else-if 里的注释）。 */
+					unsigned int prev_target = g_cmdqu_uart1_target_lr;
 					/* 限幅：两个 16 位分量各自钳到 ±CMDQU_UART1_PWM_LIMIT。
 					 * 宁可停在边界上，也不把超量程 PWM 送给底盘板。 */
 					int l = (short)(rtos_cmdq.param_ptr & 0xFFFFU);
@@ -582,21 +585,28 @@ void prvCmdQuRunTask(void *pvParameters)
 					g_cmdqu_uart1_target_lr =
 						((unsigned int)(unsigned short)l) |
 						(((unsigned int)(unsigned short)r) << 16);
-				}
-				g_cmdqu_uart1_target_set = 1U;
-				/* 刷新心跳截止时刻，并清掉"已因超时停车"的标志——
-				 * 新目标一到就恢复下发，这正是心跳语义。 */
-				g_cmdqu_uart1_wd_deadline_ms =
-					(unsigned long long)xTaskGetTickCount() *
-						(1000U / configTICK_RATE_HZ) +
-					g_cmdqu_uart1_wd_ms;
-				g_cmdqu_uart1_wd_tripped = 0U;
-				if (g_cmdqu_uart1_mode < 3U) {
-					g_cmdqu_uart1_mode = 3U;
-					/* 每次"开始一段周期控制"都重新握手：底盘可能被别的工具
-					 * RESET 过、或自己复位过，处在 UNINIT 的底盘会静默
-					 * 忽略 SET_SPEED（实板踩到过）。 */
-					g_cmdqu_uart1_ctrl_need_hs = 1U;
+					g_cmdqu_uart1_target_set = 1U;
+					/* 刷新心跳截止时刻，并清掉"已因超时停车"的标志——
+					 * 新目标一到就恢复下发，这正是心跳语义。 */
+					g_cmdqu_uart1_wd_deadline_ms =
+						(unsigned long long)xTaskGetTickCount() *
+							(1000U / configTICK_RATE_HZ) +
+						g_cmdqu_uart1_wd_ms;
+					g_cmdqu_uart1_wd_tripped = 0U;
+					if (g_cmdqu_uart1_mode < 3U) {
+						g_cmdqu_uart1_mode = 3U;
+						g_cmdqu_uart1_ctrl_need_hs = 1U;
+					} else if (prev_target == 0U && g_cmdqu_uart1_target_lr != 0U) {
+						/* 每次"从静止开始运动"都补一次握手。
+						 *
+						 * 实板教训（2026-10-03）：底盘被外部工具 RESET 之后，
+						 * 它的状态字节仍然报"运行中(3)"，但 SET_SPEED 会被
+						 * 静默丢弃——所以**不能**靠 ch_state==0 来判断"要不要
+						 * 重新握手"，那次改动就是因此没有生效。改用这个不依赖
+						 * 底盘自报状态的判据：目标从 0 变成非 0 就重握手，
+						 * 代价是一个控制周期（INIT+CONFIG 在同一拍发完）。 */
+						g_cmdqu_uart1_ctrl_need_hs = 1U;
+					}
 				}
 				rtos_cmdq.param_ptr = g_cmdqu_uart1_target_lr;
 				goto send_label;
@@ -1182,24 +1192,27 @@ void prvCmdquUart1Task(void *pvParameters)
 				}
 				dt_prev_tick = tick_now;
 
-				/* 底盘自报"未初始化"就补一次握手。底盘可能被别的工具 RESET 过，
-				 * 也可能自己复位过；UNINIT 的底盘会静默忽略 SET_SPEED（实板踩到过）。
-				 * 加 200 ms 节流：状态回包每 5 个控制周期才刷新一次，不节流的话
-				 * 会在新状态到达前反复重发 INIT。 */
+				/* 底盘自报"未初始化"就补一次握手——这只是补充判据：实板上底盘被
+				 * RESET 之后仍报"运行中"，靠它救不回来，主力判据是 SET_TARGET 分支
+				 * 里的"目标由 0 变非 0"。加 200 ms 节流：状态回包每 5 个控制周期
+				 * 才刷新一次，不节流会在新状态到达前反复重发 INIT。 */
 				if (g_cmdqu_uart1_ch_state == 0U && (now_ms - hs_sent_ms) >= 200ULL)
 					g_cmdqu_uart1_ctrl_need_hs = 1U;
 
-				/* 补握手：INIT（底盘回 IDLE）→ CONFIG（回 READY），之后才发速度；
-				 * 每拍只做一步，避免底盘板来不及处理。**UNINIT 状态下的底盘会静默
-				 * 忽略 SET_SPEED**，这一步不能省。INIT 会清掉底盘配置，所以它同时把
-				 * ctrl_cfg_sent 归零，由下一拍补 CONFIG——补握手不能只在"首次配置
-				 * 之前"这一种情形下生效（原先它就写在 ctrl_cfg_sent == 0 的分支里，
-				 * 一段控制会话里只可能生效一次）。 */
+				/* 补握手：INIT（底盘回 IDLE）→ CONFIG（回 READY），之后才发速度。
+				 * **没握过手（或被 RESET 打回 UNINIT）的底盘会静默忽略 SET_SPEED**，
+				 * 这一步不能省；补握手也不能只在"首次配置之前"这一种情形下生效
+				 * （原先它写在 ctrl_cfg_sent == 0 的分支里，一段控制会话只可能生效
+				 * 一次）。两帧在同一拍发完、这一拍不发速度帧：底盘按顺序处理帧，
+				 * 而控制的上线延迟只剩一个控制周期（默认 100 ms）。 */
 				if (g_cmdqu_uart1_ctrl_need_hs) {
+					unsigned char cfg[4] = {0x12U, 0x48U, 0x4EU, 0x20U};
+
 					cmdqu_uart1_send_init();
+					cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_CONFIG, cfg, 4U);
 					g_cmdqu_uart1_ctrl_need_hs = 0U;
 					hs_sent_ms = now_ms;
-					ctrl_cfg_sent = 0U;
+					ctrl_cfg_sent = 1U;
 					sent_this_cycle = 1U;
 				} else if (ctrl_cfg_sent == 0U) {
 					unsigned char cfg[4] = {0x12U, 0x48U, 0x4EU, 0x20U};
