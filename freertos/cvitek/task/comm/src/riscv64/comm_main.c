@@ -191,6 +191,15 @@ struct cmdqu_uart_ctrl_hist {
 #define CMDQU_FMUX_UART2_TX_OFF  0x70U /* A28 焊盘 → UART2_TX */
 #define CMDQU_FMUX_UART2_RX_OFF  0x74U /* A29 焊盘 → UART2_RX */
 #define CMDQU_FMUX_UART2_FSEL    2U
+/* CRG（时钟/复位）里 UART2 的门控：`REG_CLK_EN_1` 偏移 0x004，bit18 = 外设时钟、
+ * bit19 = APB 时钟（厂商 Linux 的 clk-cv181x.c 里这两条都标了 CLK_IS_CRITICAL，
+ * 也就是 Linux 侧一直开着——正因为如此，这个坑只在"没人开过 UART2"时才暴露）。
+ * **不打开就会卡死**：实板踩到过，大核刚上电还没开 /dev/ttyS2 时，小核第一次读
+ * UART2 寄存器就把总线挂住了（环里一条快照都没有、大核命令全部 500 ms 超时）。 */
+#define CMDQU_CRG_PBASE          0x03002000UL
+#define CMDQU_CRG_CLK_EN_1       0x004U
+#define CMDQU_CRG_UART2_CLK      (1U << 18)
+#define CMDQU_CRG_APB_UART2_CLK  (1U << 19)
 #define CMDQU_CMD_SET_SERVO      0x66U /* param = id[3:0] | pulse[15:4] | ms[31:16] */
 #define CMDQU_SERVO_ID_MAX       15U
 #define CMDQU_SERVO_PULSE_MIN    500U
@@ -1008,6 +1017,14 @@ static void cmdqu_uart1_putc(unsigned char c)
 
 static void cmdqu_uart2_hw_init(void)
 {
+	unsigned int clk_en;
+
+	/* ★ 先开 UART2 的时钟门控，再碰它的任何寄存器。
+	 * 顺序不能反：时钟没开时读 UART2 寄存器会把总线挂住（见上面的注释）。 */
+	clk_en = mmio_read_32(CMDQU_CRG_PBASE + CMDQU_CRG_CLK_EN_1);
+	clk_en |= CMDQU_CRG_UART2_CLK | CMDQU_CRG_APB_UART2_CLK;
+	mmio_write_32(CMDQU_CRG_PBASE + CMDQU_CRG_CLK_EN_1, clk_en);
+
 	/* FMUX：A28/A29 焊盘切到 UART2 TX/RX。与 uart_probe / 厂商 uart_init.sh
 	 * 写的是同一组寄存器，所以小核自己初始化后大核那边不用再补。 */
 	mmio_write_32(CMDQU_FMUX_PBASE + CMDQU_FMUX_UART2_TX_OFF, CMDQU_FMUX_UART2_FSEL);
