@@ -1686,7 +1686,11 @@ void prvCmdquReportTask(void *pvParameters)
 		/* UART1 链路测试开着时，每秒额外发一条 kind=6 的链路状态。
 		 * 与快照同一个任务发布，因此不会与环 head 的读改写打架。 */
 		now_ms = (unsigned long long)xTaskGetTickCount() * (1000U / configTICK_RATE_HZ);
-		if (g_cmdqu_uart1_mode != 0U && (now_ms - last_uart_pub_ms) >= 1000ULL) {
+		/* 底盘链路在用（mode != 0）**或者**小核接管过 UART2 时报一轮。
+		 * 后者不能漏：只发机械臂命令时底盘链路还停在 mode=0，实板踩到过
+		 * ——kind=11 明明更新了，环里却一条都没有。 */
+		if ((g_cmdqu_uart1_mode != 0U || g_cmdqu_uart2_ready != 0U) &&
+		    (now_ms - last_uart_pub_ms) >= 1000ULL) {
 			struct cmdqu_uart_link link;
 
 			link.seq = ++g_cmdqu_uart1_link_seq;
@@ -1790,27 +1794,27 @@ void prvCmdquReportTask(void *pvParameters)
 							  sizeof(safety));
 				}
 
-				/* kind=11 只在"小核已经接管 UART2"之后才发：没接管时这条 UART
-				 * 归大核，报一份全 0 的状态只会让人误会。 */
-				if (g_cmdqu_uart2_ready) {
-					struct cmdqu_uart_servo servo;
+			}
+			/* kind=11 与底盘链路模式无关：只要小核已经接管过 UART2 就上报
+			 * （放进上面那个 `mode >= 3` 分支里会漏——只发过舵机命令时底盘链路
+			 * 还停在 mode=0，实板踩到过）。没接管时这条 UART 归大核，不报。 */
+			if (g_cmdqu_uart2_ready) {
+				struct cmdqu_uart_servo servo;
 
-					servo.seq = ++g_cmdqu_uart_servo_seq;
-					servo.mode = g_cmdqu_uart2_ready;
-					servo.sent = g_cmdqu_uart_servo_sent;
-					servo.errs = g_cmdqu_uart_servo_errs;
-					servo.last_id = g_cmdqu_uart_servo_last_id;
-					servo.last_pulse = g_cmdqu_uart_servo_last_pulse;
-					servo.last_ms = g_cmdqu_uart_servo_last_ms;
-					servo.last_len = g_cmdqu_uart_servo_last_len;
-					servo.last_head = g_cmdqu_uart_servo_last_head;
-					servo.last_tail = g_cmdqu_uart_servo_last_tail;
-					servo.reserved0 = 0U;
-					servo.reserved1 = 0U;
-					cmdqu_shm_publish(hdr, CMDQU_MSG_UART_SERVO,
-							  (const unsigned char *)&servo,
-							  sizeof(servo));
-				}
+				servo.seq = ++g_cmdqu_uart_servo_seq;
+				servo.mode = g_cmdqu_uart2_ready;
+				servo.sent = g_cmdqu_uart_servo_sent;
+				servo.errs = g_cmdqu_uart_servo_errs;
+				servo.last_id = g_cmdqu_uart_servo_last_id;
+				servo.last_pulse = g_cmdqu_uart_servo_last_pulse;
+				servo.last_ms = g_cmdqu_uart_servo_last_ms;
+				servo.last_len = g_cmdqu_uart_servo_last_len;
+				servo.last_head = g_cmdqu_uart_servo_last_head;
+				servo.last_tail = g_cmdqu_uart_servo_last_tail;
+				servo.reserved0 = 0U;
+				servo.reserved1 = 0U;
+				cmdqu_shm_publish(hdr, CMDQU_MSG_UART_SERVO,
+						  (const unsigned char *)&servo, sizeof(servo));
 			}
 			last_uart_pub_ms = now_ms;
 		}
