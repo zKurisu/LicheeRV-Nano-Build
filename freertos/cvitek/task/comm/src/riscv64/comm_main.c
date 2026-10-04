@@ -179,6 +179,41 @@ struct cmdqu_uart_ctrl_hist {
 #define CMDQU_FMUX_UART1_RX_OFF  0x68U /* JTAG_CPU_TCK 焊盘 → UART1_RX */
 #define CMDQU_FMUX_UART1_FSEL    6U
 
+/* ── 机械臂：UART2（A28/A29）上的 ZP10S 总线舵机 ─────────────────────
+ * 指令格式 `#<id:03>P<pulse:04>T<ms:04>!` + `\r\n`（脉宽 500~2500 ↔ 0~270°）。
+ * **行尾 CRLF 是硬要求**：漏掉时读命令有回包、动作命令被静默丢弃（厂商 CHANGES.md
+ * 里踩过，我们在大核侧也踩过一次）。
+ *
+ * 这里只实现"发送"：小核负责把动作按确定节拍发出去；读回（PRAD）仍由大核的工具做，
+ * 而且**不能两边同时用这条 UART**——所以 UART2 是**第一次收到 0x66 时才接管**
+ * （写 FMUX + 初始化 16550），在此之前完全不碰它，大核的 /dev/ttyS2 照常可用。 */
+#define CMDQU_UART2_BASE         0x04160000UL
+#define CMDQU_FMUX_UART2_TX_OFF  0x70U /* A28 焊盘 → UART2_TX */
+#define CMDQU_FMUX_UART2_RX_OFF  0x74U /* A29 焊盘 → UART2_RX */
+#define CMDQU_FMUX_UART2_FSEL    2U
+#define CMDQU_CMD_SET_SERVO      0x66U /* param = id[3:0] | pulse[15:4] | ms[31:16] */
+#define CMDQU_SERVO_ID_MAX       15U
+#define CMDQU_SERVO_PULSE_MIN    500U
+#define CMDQU_SERVO_PULSE_MAX    2500U
+#define CMDQU_SERVO_MS_MAX       9999U
+#define CMDQU_MSG_UART_SERVO     11U
+
+/* kind=11：机械臂（UART2 直发）的状态。12×u32 = 48 字节，和其它 kind 同尺寸。 */
+struct cmdqu_uart_servo {
+	unsigned int seq;
+	unsigned int mode;        /* 1 = 小核已经接管 UART2 */
+	unsigned int sent;        /* 累计发出的动作指令数 */
+	unsigned int errs;        /* 参数非法被拒的次数 */
+	unsigned int last_id;
+	unsigned int last_pulse;
+	unsigned int last_ms;
+	unsigned int last_len;    /* 最后一次实际发出的字节数 */
+	unsigned int last_head;   /* 最后一条指令的前 4 字节（核对 '#','0','0','0'） */
+	unsigned int last_tail;   /* 最后一条指令的最后 4 字节（核对 '!','\r','\n'） */
+	unsigned int reserved0;
+	unsigned int reserved1;
+};
+
 /* UART1 链路握手的统计，作为 kind=6 的环消息载荷上报给大核 */
 struct cmdqu_uart_link {
 	unsigned int seq;
@@ -270,6 +305,18 @@ static volatile unsigned int g_cmdqu_uart1_safety_seq = 0U;
  * 停车会把内部目标清零，但大核的心跳仍在重复同一个值——拿内部值去比"变没变"
  * 会把心跳误判成新命令，于是锁存被解除、车又冲一下（实板踩到过：20 s 内触发 8 次）。 */
 static volatile unsigned int g_cmdqu_uart1_target_cmd = 0U;
+
+/* 机械臂（UART2 直发）的状态 */
+static volatile unsigned int g_cmdqu_uart2_ready = 0U;
+static volatile unsigned int g_cmdqu_uart_servo_sent = 0U;
+static volatile unsigned int g_cmdqu_uart_servo_errs = 0U;
+static volatile unsigned int g_cmdqu_uart_servo_seq = 0U;
+static volatile unsigned int g_cmdqu_uart_servo_last_id = 0U;
+static volatile unsigned int g_cmdqu_uart_servo_last_pulse = 0U;
+static volatile unsigned int g_cmdqu_uart_servo_last_ms = 0U;
+static volatile unsigned int g_cmdqu_uart_servo_last_len = 0U;
+static volatile unsigned int g_cmdqu_uart_servo_last_head = 0U;
+static volatile unsigned int g_cmdqu_uart_servo_last_tail = 0U;
 /* 最近一条非 ACK 帧的载荷（GET_STATUS 的 5 字节用得上） */
 static volatile unsigned int g_cmdqu_uart1_reply_cmd = 0U;
 static volatile unsigned int g_cmdqu_uart1_reply_len = 0U;
@@ -473,6 +520,11 @@ void main_cvirtos(void)
         ;
 }
 
+/* 前置声明：UART2（机械臂）的发送函数定义在下面（它的驱动与 UART1 同构），
+ * 但命令处理函数在它之前，所以这里先声明一下，避免隐式声明与定义类型冲突。 */
+static unsigned int cmdqu_uart2_send_servo(unsigned int id, unsigned int pulse,
+					   unsigned int time_ms);
+
 void prvCmdQuRunTask(void *pvParameters)
 {
 	/* Remove compiler warning about unused parameter. */
@@ -599,6 +651,34 @@ void prvCmdQuRunTask(void *pvParameters)
 				g_cmdqu_uart1_mode = rtos_cmdq.param_ptr;
 				rtos_cmdq.param_ptr = g_cmdqu_uart1_mode;
 				goto send_label;
+			case CMDQU_CMD_SET_SERVO:
+			{
+				/* 机械臂直发：param = id[3:0] | pulse[15:4] | ms[31:16]。
+				 *
+				 * 第一次收到这条命令时才"接管 UART2"（写 FMUX + 初始化 16550），
+				 * 在此之前完全不碰它——所以大核的 /dev/ttyS2 在没人用小核发舵机时
+				 * 照常可用。接管之后两边不能同时用这条 UART。
+				 *
+				 * 回包：成功回显 param，参数非法回 0。 */
+				unsigned int packed = rtos_cmdq.param_ptr;
+				unsigned int id = packed & 0xFU;
+				unsigned int pulse = (packed >> 4) & 0xFFFU;
+				unsigned int time_ms = (packed >> 16) & 0xFFFFU;
+				unsigned int sent = cmdqu_uart2_send_servo(id, pulse, time_ms);
+
+				g_cmdqu_uart_servo_last_id = id;
+				g_cmdqu_uart_servo_last_pulse = pulse;
+				g_cmdqu_uart_servo_last_ms = time_ms;
+				if (sent) {
+					g_cmdqu_uart_servo_last_len = sent;
+					g_cmdqu_uart_servo_sent++;
+					rtos_cmdq.param_ptr = packed;
+				} else {
+					g_cmdqu_uart_servo_errs++;
+					rtos_cmdq.param_ptr = 0U;
+				}
+				goto send_label;
+			}
 			case CMDQU_CMD_SET_TARGET:
 				/* 下发目标速度：param 低 16 位是左轮 PWM(i16)，高 16 位是右轮 PWM(i16)。
 				 *
@@ -922,6 +1002,106 @@ static void cmdqu_uart1_putc(unsigned char c)
 	       guard--)
 		;
 	mmio_write_32(CMDQU_UART1_BASE + CMDQU_UART1_RBR_THR, (unsigned int)c);
+}
+
+/* ── UART2：只发送（机械臂舵机） ──────────────────────────────────────── */
+
+static void cmdqu_uart2_hw_init(void)
+{
+	/* FMUX：A28/A29 焊盘切到 UART2 TX/RX。与 uart_probe / 厂商 uart_init.sh
+	 * 写的是同一组寄存器，所以小核自己初始化后大核那边不用再补。 */
+	mmio_write_32(CMDQU_FMUX_PBASE + CMDQU_FMUX_UART2_TX_OFF, CMDQU_FMUX_UART2_FSEL);
+	mmio_write_32(CMDQU_FMUX_PBASE + CMDQU_FMUX_UART2_RX_OFF, CMDQU_FMUX_UART2_FSEL);
+
+	/* 115200 8N1，与 UART1 同一套分频假设（26 MHz 输入、DLL=14 → 116071 baud，+0.76%） */
+	mmio_write_32(CMDQU_UART2_BASE + CMDQU_UART1_LCR, 0x83U);
+	mmio_write_32(CMDQU_UART2_BASE + CMDQU_UART1_RBR_THR, 14U);
+	mmio_write_32(CMDQU_UART2_BASE + CMDQU_UART1_IER_DLM, 0U);
+	mmio_write_32(CMDQU_UART2_BASE + CMDQU_UART1_LCR, 0x03U);
+	mmio_write_32(CMDQU_UART2_BASE + CMDQU_UART1_FCR_IIR, 0x07U);
+	mmio_write_32(CMDQU_UART2_BASE + CMDQU_UART1_IER_DLM, 0U);
+}
+
+static void cmdqu_uart2_putc(unsigned char c)
+{
+	unsigned int guard = 200000U;
+
+	while (!(mmio_read_32(CMDQU_UART2_BASE + CMDQU_UART1_LSR) & CMDQU_LSR_THR_EMPTY) &&
+	       guard--)
+		;
+	mmio_write_32(CMDQU_UART2_BASE + CMDQU_UART1_RBR_THR, (unsigned int)c);
+}
+
+/* 把定长十进制写进 buf（前导 0），返回写入的位数 */
+static unsigned int cmdqu_uart2_put_dec(unsigned char *buf, unsigned int value,
+					unsigned int digits)
+{
+	unsigned int i;
+
+	for (i = 0; i < digits; i++) {
+		buf[digits - 1U - i] = (unsigned char)('0' + (value % 10U));
+		value /= 10U;
+	}
+	return digits;
+}
+
+/* 发一条舵机动作，返回实际发出的字节数；参数非法返回 0。
+ *
+ * 先发 `#<id>PULR!` 恢复力矩（大核的工具也是这么做的），再发动作——两条之间只是一小段
+ * 忙等：ZP10S 的建议"连续指令间隔 ≥300 ms"针对的是**动作**指令，PULR+动作这一对
+ * 按厂商示例是紧邻发的（大核工具里是 30 ms）。 */
+static unsigned int cmdqu_uart2_send_servo(unsigned int id, unsigned int pulse,
+					   unsigned int time_ms)
+{
+	unsigned char buf[20];
+	unsigned int n = 0U, i;
+	volatile unsigned int spin;
+
+	if (id > CMDQU_SERVO_ID_MAX || pulse < CMDQU_SERVO_PULSE_MIN ||
+	    pulse > CMDQU_SERVO_PULSE_MAX || time_ms == 0U || time_ms > CMDQU_SERVO_MS_MAX)
+		return 0U;
+
+	if (!g_cmdqu_uart2_ready) {
+		cmdqu_uart2_hw_init();
+		g_cmdqu_uart2_ready = 1U;
+	}
+
+	buf[n++] = '#';
+	n += cmdqu_uart2_put_dec(buf + n, id, 3U);
+	buf[n++] = 'P';
+	buf[n++] = 'U';
+	buf[n++] = 'L';
+	buf[n++] = 'R';
+	buf[n++] = '!';
+	buf[n++] = '\r';
+	buf[n++] = '\n';
+	for (i = 0U; i < n; i++)
+		cmdqu_uart2_putc(buf[i]);
+	for (spin = 0U; spin < 2000000U; spin++)
+		;
+
+	n = 0U;
+	buf[n++] = '#';
+	n += cmdqu_uart2_put_dec(buf + n, id, 3U);
+	buf[n++] = 'P';
+	n += cmdqu_uart2_put_dec(buf + n, pulse, 4U);
+	buf[n++] = 'T';
+	n += cmdqu_uart2_put_dec(buf + n, time_ms, 4U);
+	buf[n++] = '!';
+	buf[n++] = '\r';
+	buf[n++] = '\n';
+	for (i = 0U; i < n; i++)
+		cmdqu_uart2_putc(buf[i]);
+
+	g_cmdqu_uart_servo_last_head = ((unsigned int)buf[0]) |
+				       ((unsigned int)buf[1] << 8) |
+				       ((unsigned int)buf[2] << 16) |
+				       ((unsigned int)buf[3] << 24);
+	g_cmdqu_uart_servo_last_tail = ((unsigned int)buf[n - 4U]) |
+				       ((unsigned int)buf[n - 3U] << 8) |
+				       ((unsigned int)buf[n - 2U] << 16) |
+				       ((unsigned int)buf[n - 1U] << 24);
+	return n;
 }
 
 /* 发一帧底盘协议报文：AA 55 cmd len payload… cksum（逐字节异或，含 cmd 与 len）。
@@ -1608,6 +1788,28 @@ void prvCmdquReportTask(void *pvParameters)
 					cmdqu_shm_publish(hdr, CMDQU_MSG_UART_SAFETY,
 							  (const unsigned char *)&safety,
 							  sizeof(safety));
+				}
+
+				/* kind=11 只在"小核已经接管 UART2"之后才发：没接管时这条 UART
+				 * 归大核，报一份全 0 的状态只会让人误会。 */
+				if (g_cmdqu_uart2_ready) {
+					struct cmdqu_uart_servo servo;
+
+					servo.seq = ++g_cmdqu_uart_servo_seq;
+					servo.mode = g_cmdqu_uart2_ready;
+					servo.sent = g_cmdqu_uart_servo_sent;
+					servo.errs = g_cmdqu_uart_servo_errs;
+					servo.last_id = g_cmdqu_uart_servo_last_id;
+					servo.last_pulse = g_cmdqu_uart_servo_last_pulse;
+					servo.last_ms = g_cmdqu_uart_servo_last_ms;
+					servo.last_len = g_cmdqu_uart_servo_last_len;
+					servo.last_head = g_cmdqu_uart_servo_last_head;
+					servo.last_tail = g_cmdqu_uart_servo_last_tail;
+					servo.reserved0 = 0U;
+					servo.reserved1 = 0U;
+					cmdqu_shm_publish(hdr, CMDQU_MSG_UART_SERVO,
+							  (const unsigned char *)&servo,
+							  sizeof(servo));
 				}
 			}
 			last_uart_pub_ms = now_ms;
