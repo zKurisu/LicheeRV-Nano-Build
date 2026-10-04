@@ -68,6 +68,27 @@
 /* 环消息类型：UART1 控制周期分布（mode>=3 时每秒上报，累计值） */
 #define CMDQU_MSG_UART_CTRL_HIST 9U
 
+/* 10：底盘安全状态（堵转/碰撞的软件判据）。单独一条 kind 是为了不动 kind=8/9 的
+ * 既有布局（那两个都是 48 字节、已经占满环消息载荷）。 */
+#define CMDQU_MSG_UART_SAFETY    10U
+
+/* kind=10 的载荷：12 个 32 位字 = 48 字节，与环消息载荷上限一致。
+ * 两个 RPM 打包成 `rpm_pair` 是为了守住 48 字节（高 16 = 左，低 16 = 右，都是 i16）。 */
+struct cmdqu_uart_safety {
+	unsigned int seq;
+	unsigned int mode;
+	unsigned int status_every;   /* 每几个控制周期读一次状态 */
+	unsigned int stall_pwm_min;
+	unsigned int stall_rpm_max;
+	unsigned int stall_confirm;  /* 连续命中多少次才判 */
+	unsigned int stall_grace_ms;
+	unsigned int stall_streak;   /* 当前连续命中次数（判定用的中间量） */
+	unsigned int stall_stops;    /* 因堵转/碰撞而自动停车的累计次数 */
+	unsigned int tripped;        /* 1 = 处于锁存：等新目标才解除 */
+	unsigned int target_lr;      /* 判定当下的目标（低 16 左 / 高 16 右） */
+	unsigned int rpm_pair;       /* 判定当下的回读转速 */
+};
+
 /****************************************************************************
  * 小核侧 UART1：直接与底盘控制板对话（焊盘 A18/A19）
  *
@@ -98,7 +119,18 @@
 #define CMDQU_UART1_TICK_MS      5U   /* 任务基础节拍 = 1 个 tick（200 Hz） */
 #define CMDQU_UART1_WD_MS        500U /* 大核心跳超时：超过它就自动停车 */
 #define CMDQU_UART1_CTRL_DEF_MS  100U /* 默认控制周期 */
-#define CMDQU_UART1_STATUS_EVERY 5U   /* 每 N 个控制周期读一次状态/转速 */
+#define CMDQU_UART1_STATUS_EVERY 2U   /* 每 N 个控制周期读一次状态/转速 */
+/* 原先每 5 拍（500 ms）读一次状态，对"堵转就停"太慢；2 拍 = 200 ms（默认 100 ms 周期）。
+ * 代价是这条链路上的往返帧变多，实测帧错误 0、余量够（见 docs/11 第 6.3 节）。 */
+
+/* ── 堵转/碰撞的**软件**判据 ─────────────────────────────────────────
+ * 不给车加任何新组件：底盘板本来就在回包里带双轮转速，如果"明确下了速度、轮子却
+ * 都不转"，那就是撞住/被顶住/电机线断/掉压——安全语义上同样是"该停"。
+ * 判据 = 目标 PWM 越过死区 + 转速接近 0 + 连续 N 次回读都成立 + 已过起步宽限期。 */
+#define CMDQU_UART1_STALL_PWM_MIN  20     /* 目标 PWM 要有这么大（14% 死区之上） */
+#define CMDQU_UART1_STALL_RPM_MAX  5      /* 两个轮子的 |RPM| 都低于它 = 没在转 */
+#define CMDQU_UART1_STALL_CONFIRM  3U     /* 连续这么多次回读都成立才判（≈600 ms） */
+#define CMDQU_UART1_STALL_GRACE_MS 700ULL /* 刚下发/改目标后的宽限期：起步本来就要几百 ms */
 #define CMDQU_UART1_PWM_LIMIT    150  /* 目标 PWM 限幅（与 AKA-00 的 speed_scale 一致） */
 
 /* UART1 周期控制状态，作为 kind=8 的环消息载荷（mode>=3 时每秒一条）。
@@ -228,6 +260,16 @@ static volatile unsigned int g_cmdqu_uart1_hist_ge = 0U;
 static volatile unsigned int g_cmdqu_uart1_ch_state = 0xFFU; /* 底盘回包里的状态机 */
 static volatile int g_cmdqu_uart1_rpm_l = 0;
 static volatile int g_cmdqu_uart1_rpm_r = 0;
+/* 堵转/碰撞软件判据的状态：命中连击数、累计停车次数、锁存标志、最近一次目标变化时刻 */
+static volatile unsigned int g_cmdqu_uart1_stall_streak = 0U;
+static volatile unsigned int g_cmdqu_uart1_stall_stops = 0U;
+static volatile unsigned int g_cmdqu_uart1_stall_tripped = 0U;
+static volatile unsigned long long g_cmdqu_uart1_target_ms = 0ULL;
+static volatile unsigned int g_cmdqu_uart1_safety_seq = 0U;
+/* 大核**最后一次要求**的目标值（限幅后）。与"内部当前目标"分开记：堵转/看门狗
+ * 停车会把内部目标清零，但大核的心跳仍在重复同一个值——拿内部值去比"变没变"
+ * 会把心跳误判成新命令，于是锁存被解除、车又冲一下（实板踩到过：20 s 内触发 8 次）。 */
+static volatile unsigned int g_cmdqu_uart1_target_cmd = 0U;
 /* 最近一条非 ACK 帧的载荷（GET_STATUS 的 5 字节用得上） */
 static volatile unsigned int g_cmdqu_uart1_reply_cmd = 0U;
 static volatile unsigned int g_cmdqu_uart1_reply_len = 0U;
@@ -566,6 +608,9 @@ void prvCmdQuRunTask(void *pvParameters)
 				 *
 				 * 收到目标即进入 mode=3（周期控制），大核不必再单独发 0x61。 */
 				{
+					/* 大核上一次要求的值。注意用它（而不是内部当前目标）来判断
+					 * "大核是不是改了主意"：内部目标会被停车逻辑清零。 */
+					unsigned int prev_cmd = g_cmdqu_uart1_target_cmd;
 					/* 改之前的目标：由 0 变成非 0 表示"要从静止开始一段运动"，
 					 * 那一拍要重新握手（原因见下面 else-if 里的注释）。 */
 					unsigned int prev_target = g_cmdqu_uart1_target_lr;
@@ -593,6 +638,19 @@ void prvCmdQuRunTask(void *pvParameters)
 							(1000U / configTICK_RATE_HZ) +
 						g_cmdqu_uart1_wd_ms;
 					g_cmdqu_uart1_wd_tripped = 0U;
+					g_cmdqu_uart1_target_cmd = g_cmdqu_uart1_target_lr;
+					/* 堵转锁存的解除条件比看门狗严：**心跳重复同一个目标值不算
+					 * "新目标"**。否则大核每 100 ms 喂一次心跳就等于每 100 ms 清一次
+					 * 锁存，车会变成"停一下、又冲一下"地反复挣扎——既危险又难诊断。
+					 * 只有两种情况解除：目标值真的变了（大核明确改主意），或者先归零。 */
+					if (prev_cmd != g_cmdqu_uart1_target_cmd ||
+					    g_cmdqu_uart1_target_cmd == 0U) {
+						g_cmdqu_uart1_stall_tripped = 0U;
+						g_cmdqu_uart1_stall_streak = 0U;
+						g_cmdqu_uart1_target_ms =
+							(unsigned long long)xTaskGetTickCount() *
+							(1000U / configTICK_RATE_HZ);
+					}
 					if (g_cmdqu_uart1_mode < 3U) {
 						g_cmdqu_uart1_mode = 3U;
 						g_cmdqu_uart1_ctrl_need_hs = 1U;
@@ -1073,6 +1131,12 @@ void prvCmdquUart1Task(void *pvParameters)
 				g_cmdqu_uart1_ch_state = 0xFFU;
 				g_cmdqu_uart1_rpm_l = 0;
 				g_cmdqu_uart1_rpm_r = 0;
+				/* 堵转判据也跟着一段新会话清零（锁存同样解除） */
+				g_cmdqu_uart1_stall_streak = 0U;
+				g_cmdqu_uart1_stall_stops = 0U;
+				g_cmdqu_uart1_stall_tripped = 0U;
+				g_cmdqu_uart1_target_ms = 0ULL;
+				g_cmdqu_uart1_target_cmd = 0U;
 				ctrl_div = 0U;
 				dt_prev_tick = 0U;
 				ctrl_cfg_sent = 0U;
@@ -1227,6 +1291,8 @@ void prvCmdquUart1Task(void *pvParameters)
 						/* 还没收到目标：不发控制帧，等大核下发 */
 					} else if (g_cmdqu_uart1_wd_tripped) {
 						/* 已因心跳超时停车：保持静默，等新的目标把它清掉 */
+					} else if (g_cmdqu_uart1_stall_tripped) {
+						/* 已因堵转/碰撞停车：同样保持静默，等新的目标 */
 					} else if (now_ms > g_cmdqu_uart1_wd_deadline_ms) {
 						/* ★ 安全兜底：大核超过看门狗窗口没刷新目标就立即停车。
 						 * 这正是"OS/应用失效后车不会一直跑"的那条保证。
@@ -1278,6 +1344,47 @@ void prvCmdquUart1Task(void *pvParameters)
 					g_cmdqu_uart1_ch_state = b0;
 					g_cmdqu_uart1_rpm_l = (int)(short)(((unsigned int)b1 << 8) | b2);
 					g_cmdqu_uart1_rpm_r = (int)(short)(((unsigned int)b3 << 8) | b4);
+
+					/* ★ 堵转/碰撞的软件判据（不需要任何新增硬件）。
+					 * 明确下了速度、两个轮子却都不转 → 撞住/被顶住/电机线断/掉压。
+					 * 三条约束缺一不可：越过死区的目标、连续 N 次回读、已过起步宽限期
+					 * （起步时 0 → 40 RPM 本来就要几百毫秒，不排掉会误判）。 */
+					{
+						int tl = (short)(g_cmdqu_uart1_target_lr & 0xFFFFU);
+						int tr = (short)(g_cmdqu_uart1_target_lr >> 16);
+						int commanded =
+							(tl >= CMDQU_UART1_STALL_PWM_MIN ||
+							 tl <= -CMDQU_UART1_STALL_PWM_MIN ||
+							 tr >= CMDQU_UART1_STALL_PWM_MIN ||
+							 tr <= -CMDQU_UART1_STALL_PWM_MIN);
+						int still =
+							(g_cmdqu_uart1_rpm_l <= CMDQU_UART1_STALL_RPM_MAX &&
+							 g_cmdqu_uart1_rpm_l >= -CMDQU_UART1_STALL_RPM_MAX &&
+							 g_cmdqu_uart1_rpm_r <= CMDQU_UART1_STALL_RPM_MAX &&
+							 g_cmdqu_uart1_rpm_r >= -CMDQU_UART1_STALL_RPM_MAX);
+
+						if (!g_cmdqu_uart1_stall_tripped && commanded && still &&
+						    now_ms - g_cmdqu_uart1_target_ms >
+							    CMDQU_UART1_STALL_GRACE_MS) {
+							g_cmdqu_uart1_stall_streak++;
+							if (g_cmdqu_uart1_stall_streak >=
+							    CMDQU_UART1_STALL_CONFIRM) {
+								unsigned char sid;
+
+								sid = 0U;
+								cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP,
+										       &sid, 1U);
+								sid = 1U;
+								cmdqu_uart1_send_frame(CMDQU_MOTOR_CMD_STOP,
+										       &sid, 1U);
+								g_cmdqu_uart1_target_lr = 0U;
+								g_cmdqu_uart1_stall_tripped = 1U;
+								g_cmdqu_uart1_stall_stops++;
+							}
+						} else {
+							g_cmdqu_uart1_stall_streak = 0U;
+						}
+					}
 				}
 			}
 		}
@@ -1476,6 +1583,31 @@ void prvCmdquReportTask(void *pvParameters)
 					cmdqu_shm_publish(hdr, CMDQU_MSG_UART_CTRL_HIST,
 							  (const unsigned char *)&hist,
 							  sizeof(hist));
+				}
+
+				{
+					struct cmdqu_uart_safety safety;
+
+					safety.seq = ++g_cmdqu_uart1_safety_seq;
+					safety.mode = g_cmdqu_uart1_mode;
+					safety.status_every = CMDQU_UART1_STATUS_EVERY;
+					safety.stall_pwm_min = CMDQU_UART1_STALL_PWM_MIN;
+					safety.stall_rpm_max = CMDQU_UART1_STALL_RPM_MAX;
+					safety.stall_confirm = CMDQU_UART1_STALL_CONFIRM;
+					safety.stall_grace_ms = (unsigned int)CMDQU_UART1_STALL_GRACE_MS;
+					safety.stall_streak = g_cmdqu_uart1_stall_streak;
+					safety.stall_stops = g_cmdqu_uart1_stall_stops;
+					safety.tripped = g_cmdqu_uart1_stall_tripped;
+					safety.target_lr = g_cmdqu_uart1_target_lr;
+					safety.rpm_pair =
+						((unsigned int)(unsigned short)
+							 (short)g_cmdqu_uart1_rpm_l) |
+						(((unsigned int)(unsigned short)
+								  (short)g_cmdqu_uart1_rpm_r)
+						 << 16);
+					cmdqu_shm_publish(hdr, CMDQU_MSG_UART_SAFETY,
+							  (const unsigned char *)&safety,
+							  sizeof(safety));
 				}
 			}
 			last_uart_pub_ms = now_ms;
